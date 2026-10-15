@@ -164,16 +164,23 @@ class Room:
         self._last_output = output
         self._last_error = target - reading
         for index, trv in available:
-            await self._ensure_direct(index, trv)
-            if trv.valve is None or should_write_valve(
-                output, trv.valve, self._settings.min_valve_change
+            # Entering direct mode moves the valve to its last direct-mode value,
+            # which the readback does not show yet.
+            entered = await self._ensure_direct(index, trv)
+            if (
+                entered
+                or trv.valve is None
+                or should_write_valve(
+                    output, trv.valve, self._settings.min_valve_change
+                )
             ):
                 self._device_writes += await trv.set_valve(output)
             await self._update_offset(trv, reading)
 
-    async def _ensure_direct(self, index: int, trv: Trv) -> None:
+    async def _ensure_direct(self, index: int, trv: Trv) -> bool:
+        """Put the TRV in direct mode; return whether it was switched just now."""
         if trv.mode is TrvMode.DIRECT:
-            return
+            return False
         if index in self._directed:
             _LOGGER.warning(
                 "%s: TRV %d left direct mode (now %s) without the room switching it",
@@ -184,8 +191,9 @@ class Room:
         if await trv.enter_direct():
             self._device_writes += 1
             self._directed.add(index)
-        else:
-            self._directed.discard(index)
+            return True
+        self._directed.discard(index)
+        return False
 
     async def _update_offset(self, trv: Trv, reading: float) -> None:
         if trv.own_temperature is None:
