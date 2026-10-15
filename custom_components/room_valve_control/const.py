@@ -34,7 +34,7 @@ class RoomParameters(TypedDict):
 
 
 class RoomConfig(RoomParameters):
-    """A room subentry's data."""
+    """A room subentry's data, its sensors and TRVs by entity registry id."""
 
     sensors: list[str]
     trvs: list[str]

@@ -73,6 +73,7 @@
       },
       "error": {
         "no_sensor": "Select at least one wall temperature sensor.",
+        "sensor_not_registered": "{sensor} has no unique ID, so the room could not find it again after a rename. Give it a unique ID or select another sensor.",
         "no_trv": "Select at least one TRV.",
         "trv_in_use": "{trv} already belongs to the room {room}.",
         "trv_entity_missing": "{trv} is not usable: its {entity} entity was not found. Only Eurotronic Spirit TRVs on Z-Wave JS are supported.",

@@ -18,6 +18,7 @@ from homeassistant.config_entries import (
 from homeassistant.const import CONF_NAME, PERCENTAGE, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.selector import (
     DurationSelector,
     EntitySelector,
@@ -52,6 +53,7 @@ from .const import (
     RoomParameters,
 )
 from .controller import ENDPOINT_TOLERANCE, VALVE_MAX
+from .registry import resolve_entity_id
 from .spirit import SpiritEntityError, SpiritTrv
 
 if TYPE_CHECKING:
@@ -146,13 +148,27 @@ class _RoomForm:
     trvs: list[str]
     parameters: RoomParameters
 
-    def config(self) -> RoomConfig:
-        """Return the room's subentry data."""
+    def config(self, registry: er.EntityRegistry) -> RoomConfig:
+        """Return the room's subentry data; every entity must be registered."""
         return {
             **self.parameters,
-            CONF_SENSORS: self.sensors,
-            CONF_TRVS: self.trvs,
+            CONF_SENSORS: _registry_ids(registry, self.sensors),
+            CONF_TRVS: _registry_ids(registry, self.trvs),
         }
+
+
+def _registry_ids(registry: er.EntityRegistry, entity_ids: list[str]) -> list[str]:
+    entries = (registry.async_get(entity_id) for entity_id in entity_ids)
+    return list(dict.fromkeys(entry.id for entry in entries if entry is not None))
+
+
+def _current_entity_ids(hass: HomeAssistant, registry_ids: list[str]) -> list[str]:
+    """Return the entity ids of the registry ids that still exist."""
+    return [
+        entity_id
+        for registry_id in registry_ids
+        if (entity_id := resolve_entity_id(hass, registry_id)) is not None
+    ]
 
 
 def _parse(user_input: Mapping[str, Any]) -> _RoomForm:
@@ -162,8 +178,8 @@ def _parse(user_input: Mapping[str, Any]) -> _RoomForm:
 
     return _RoomForm(
         name=user_input[CONF_NAME],
-        sensors=list(dict.fromkeys(user_input[CONF_SENSORS])),
-        trvs=list(dict.fromkeys(user_input[CONF_TRVS])),
+        sensors=user_input[CONF_SENSORS],
+        trvs=user_input[CONF_TRVS],
         parameters={
             CONF_KP: user_input[CONF_KP],
             CONF_TI: seconds(CONF_TI),
@@ -203,6 +219,19 @@ def _parameter_errors(parameters: RoomParameters) -> dict[str, str]:
     return errors
 
 
+def _sensor_error(
+    registry: er.EntityRegistry, sensors: list[str]
+) -> tuple[str, dict[str, str]] | None:
+    """Return the first selected sensor's error and its placeholders."""
+    if not sensors:
+        return "no_sensor", {}
+    for sensor in sensors:
+        # Without a registry entry a renamed sensor could not be found again.
+        if registry.async_get(sensor) is None:
+            return "sensor_not_registered", {"sensor": sensor}
+    return None
+
+
 def _trv_error(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -212,16 +241,18 @@ def _trv_error(
     """Return the first selected TRV's error and its placeholders."""
     if not trvs:
         return "no_trv", {}
+    registry = er.async_get(hass)
     other_rooms = {
-        trv: subentry.title
+        registry_id: subentry.title
         for subentry in entry.subentries.values()
         if subentry.subentry_type == SUBENTRY_TYPE_ROOM
         and subentry.subentry_id != own_subentry_id
-        for trv in subentry.data[CONF_TRVS]
+        for registry_id in subentry.data[CONF_TRVS]
     }
     for trv in trvs:
-        if trv in other_rooms:
-            return "trv_in_use", {"trv": trv, "room": other_rooms[trv]}
+        registry_entry = registry.async_get(trv)
+        if registry_entry is not None and registry_entry.id in other_rooms:
+            return "trv_in_use", {"trv": trv, "room": other_rooms[registry_entry.id]}
         try:
             SpiritTrv(hass, trv)
         except SpiritEntityError as err:
@@ -245,11 +276,13 @@ def _validate(
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Return the form's errors by field and the placeholders they use."""
     errors = _parameter_errors(room.parameters)
-    if not room.sensors:
-        errors[CONF_SENSORS] = "no_sensor"
     placeholders: dict[str, str] = {}
+    if sensor_error := _sensor_error(er.async_get(hass), room.sensors):
+        errors[CONF_SENSORS], sensor_placeholders = sensor_error
+        placeholders |= sensor_placeholders
     if trv_error := _trv_error(hass, entry, room.trvs, own_subentry_id):
-        errors[CONF_TRVS], placeholders = trv_error
+        errors[CONF_TRVS], trv_placeholders = trv_error
+        placeholders |= trv_placeholders
     return errors, placeholders
 
 
@@ -289,7 +322,9 @@ class RoomSubentryFlow(ConfigSubentryFlow):
             room = _parse(user_input)
             errors, placeholders = _validate(self.hass, self._get_entry(), room, None)
             if not errors:
-                return self.async_create_entry(title=room.name, data=room.config())
+                return self.async_create_entry(
+                    title=room.name, data=room.config(er.async_get(self.hass))
+                )
         return self._show_room_form(
             "user", _form_values(None, DEFAULT_ROOM), user_input, errors, placeholders
         )
@@ -309,11 +344,23 @@ class RoomSubentryFlow(ConfigSubentryFlow):
             )
             if not errors:
                 return self.async_update_and_abort(
-                    entry, subentry, title=room.name, data=room.config()
+                    entry,
+                    subentry,
+                    title=room.name,
+                    data=room.config(er.async_get(self.hass)),
                 )
         return self._show_room_form(
             "reconfigure",
-            _form_values(subentry.title, subentry.data),
+            _form_values(
+                subentry.title,
+                {
+                    **subentry.data,
+                    CONF_SENSORS: _current_entity_ids(
+                        self.hass, subentry.data[CONF_SENSORS]
+                    ),
+                    CONF_TRVS: _current_entity_ids(self.hass, subentry.data[CONF_TRVS]),
+                },
+            ),
             user_input,
             errors,
             placeholders,
