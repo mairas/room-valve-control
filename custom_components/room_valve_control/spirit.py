@@ -87,21 +87,32 @@ class SpiritEntity(StrEnum):
 
 
 class SpiritEntityError(Exception):
-    """A Spirit TRV entity the adapter needs is missing or disabled."""
+    """A Spirit TRV entity the adapter needs is missing, disabled or deviceless."""
 
     def __init__(
-        self, entity: SpiritEntity, entity_id: str | None, *, disabled: bool = False
+        self,
+        entity: SpiritEntity,
+        entity_id: str | None,
+        *,
+        disabled: bool = False,
+        no_device: bool = False,
     ) -> None:
-        """Record which entity is missing or disabled."""
+        """Record which entity is unusable and why."""
         self.entity = entity
         self.entity_id = entity_id
         self.disabled = disabled
-        problem = "is disabled" if disabled else "was not found"
+        self.no_device = no_device
+        if disabled:
+            problem = "is disabled"
+        elif no_device:
+            problem = "has no device"
+        else:
+            problem = "was not found"
         name = f"{entity} entity {entity_id}" if entity_id else f"{entity} entity"
         super().__init__(f"Spirit {name} {problem}")
 
 
-def own_temperature(reported: float, offset: float) -> float:
+def remove_offset(reported: float, offset: float) -> float:
     """
     Return the TRV's own reading from the reported temperature.
 
@@ -119,11 +130,10 @@ def offset_to_tenths(offset: float) -> int:
 def _is_value(entry: er.RegistryEntry, command_class: int, property_: str) -> bool:
     _, _, value_id = entry.unique_id.partition(".")
     parts = value_id.split("-")
-    return (
-        len(parts) == _VALUE_ID_PARTS
-        and parts[1] == str(command_class)
-        and parts[3] == property_
-    )
+    if len(parts) != _VALUE_ID_PARTS:
+        return False
+    _node, value_command_class, _endpoint, value_property = parts
+    return value_command_class == str(command_class) and value_property == property_
 
 
 def _usable(
@@ -141,9 +151,9 @@ def _find_number(
     entity: SpiritEntity,
     command_class: int,
     property_: str,
-) -> str:
+) -> er.RegistryEntry:
     entry = next((e for e in numbers if _is_value(e, command_class, property_)), None)
-    return _usable(entity, entry, None).entity_id
+    return _usable(entity, entry, None)
 
 
 class SpiritTrv:
@@ -161,8 +171,9 @@ class SpiritTrv:
             climate_entity_id,
         )
         if climate.device_id is None:
-            raise SpiritEntityError(SpiritEntity.CLIMATE, climate_entity_id)
-        self.climate_entity_id = climate.entity_id
+            raise SpiritEntityError(
+                SpiritEntity.CLIMATE, climate_entity_id, no_device=True
+            )
         device_entries = er.async_entries_for_device(
             registry, climate.device_id, include_disabled_entities=True
         )
@@ -181,17 +192,44 @@ class SpiritTrv:
             ),
             None,
         )
-        self.valve_entity_id = _find_number(
+        valve = _find_number(
             numbers,
             SpiritEntity.VALVE_CONTROL,
             COMMAND_CLASS_SWITCH_MULTILEVEL,
             VALVE_PROPERTY,
         )
-        self.offset_entity_id = _find_number(
+        offset = _find_number(
             numbers,
             SpiritEntity.TEMPERATURE_OFFSET,
             COMMAND_CLASS_CONFIGURATION,
             str(OFFSET_PARAMETER),
+        )
+        # Kept by unique id and looked up on every read, so that renaming an
+        # entity while loaded does not lose it.
+        self._climate = (climate.domain, climate.unique_id, climate.entity_id)
+        self._valve = (valve.domain, valve.unique_id, valve.entity_id)
+        self._offset = (offset.domain, offset.unique_id, offset.entity_id)
+
+    @property
+    def climate_entity_id(self) -> str:
+        """Return the climate entity's current id."""
+        return self._entity_id(*self._climate)
+
+    @property
+    def valve_entity_id(self) -> str:
+        """Return the valve number entity's current id."""
+        return self._entity_id(*self._valve)
+
+    @property
+    def offset_entity_id(self) -> str:
+        """Return the parameter 8 number entity's current id."""
+        return self._entity_id(*self._offset)
+
+    def _entity_id(self, domain: str, unique_id: str, at_setup: str) -> str:
+        # A removed entity keeps its last id, which then has no state.
+        registry = er.async_get(self._hass)
+        return (
+            registry.async_get_entity_id(domain, ZWAVE_JS_DOMAIN, unique_id) or at_setup
         )
 
     @property
@@ -202,10 +240,8 @@ class SpiritTrv:
             return False
         if self._node_status_unique_id is None:
             return True
-        status_id = er.async_get(self._hass).async_get_entity_id(
-            SENSOR_DOMAIN, ZWAVE_JS_DOMAIN, self._node_status_unique_id
-        )
-        status = None if status_id is None else self._hass.states.get(status_id)
+        status_id = self._entity_id(SENSOR_DOMAIN, self._node_status_unique_id, "")
+        status = self._hass.states.get(status_id) if status_id else None
         return status is None or status.state != NODE_STATUS_DEAD
 
     @property
@@ -257,7 +293,7 @@ class SpiritTrv:
         offset = self.offset
         if reported is None or offset is None:
             return None
-        return own_temperature(reported, offset)
+        return remove_offset(reported, offset)
 
     async def enter_direct(self) -> bool:
         """Select the Manufacturer specific preset."""
