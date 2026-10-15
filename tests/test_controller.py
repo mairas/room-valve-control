@@ -4,6 +4,7 @@ import math
 import random
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -14,6 +15,9 @@ from custom_components.room_valve_control.controller import (
     PIGains,
     should_write_valve,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 GAINS = PIGains(kp=30.0, ti=timedelta(hours=2))
 STEP = timedelta(minutes=15)
@@ -131,13 +135,18 @@ def test_integration_not_allowed_freezes_integrator() -> None:
         (3.0, 6.0, False),
         (0.0, 6.0, True),
         (0.0, 0.0, False),
+        (0.0, 1.0, False),
+        (0.0, 2.0, False),
+        (0.0, 3.0, True),
         (96.0, 93.0, False),
         (99.0, 93.0, True),
+        (99.0, 96.0, True),
+        (99.0, 97.0, False),
         (99.0, 99.0, False),
     ],
 )
 def test_should_write_valve(*, output: float, readback: float, expected: bool) -> None:
-    """Writes need the minimum change, except to reach a fully closed or open valve."""
+    """Writes need the minimum change, or an endpoint off by more than its tolerance."""
     assert should_write_valve(output, readback, MIN_CHANGE) is expected
 
 
@@ -191,6 +200,8 @@ WRITES_PER_DAY_LIMIT = 72
 ROOM_TIME_CONSTANT = timedelta(hours=8)
 HEATING_AT_FULL_VALVE = 4.0  # °C/h with the valve at 100 %
 OUTDOOR_MEAN = 5.0
+# Mild enough that solar gain overheats the room and pins the output at 0 for hours.
+WARM_OUTDOOR_MEAN = 20.0
 OUTDOOR_SWING = 3.0
 SOLAR_GAIN_PEAK = 1.0  # °C/h at midday
 SENSOR_NOISE = 0.05
@@ -210,9 +221,11 @@ class SimulationResult:
     mean_abs_error: float
 
 
-def _room_drift(hour_of_day: float, temperature: float, valve: float) -> float:
+def _room_drift(
+    hour_of_day: float, temperature: float, valve: float, outdoor_mean: float
+) -> float:
     """Return the room temperature change rate in °C/h."""
-    outdoor = OUTDOOR_MEAN - OUTDOOR_SWING * math.cos(
+    outdoor = outdoor_mean - OUTDOOR_SWING * math.cos(
         2 * math.pi * (hour_of_day - OUTDOOR_COLDEST_HOUR) / HOURS_PER_DAY
     )
     solar = 0.0
@@ -227,8 +240,33 @@ def _room_drift(hour_of_day: float, temperature: float, valve: float) -> float:
     return HEATING_AT_FULL_VALVE * valve / FULL_VALVE + solar - loss
 
 
-def simulate(gains: PIGains) -> SimulationResult:
-    """Run direct control on a first-order room model with noise and disturbances."""
+def _exact_trv(written: float) -> float:
+    """Return the readback of a TRV that reports exactly what was written."""
+    return written
+
+
+def _off_by_one_endpoint_trv(written: float) -> float:
+    """Return the readback of a TRV that reports 1 % short of either endpoint."""
+    if written == VALVE_MIN:
+        return VALVE_MIN + 1
+    if written == VALVE_MAX:
+        return VALVE_MAX - 1
+    return written
+
+
+def simulate(
+    gains: PIGains,
+    trv: Callable[[float], float] = _exact_trv,
+    *,
+    whole_percent: bool = False,
+    outdoor_mean: float = OUTDOOR_MEAN,
+) -> SimulationResult:
+    """
+    Run direct control on a first-order room model with noise and disturbances.
+
+    `trv` maps a written position to the readback and the valve's actual
+    position; `whole_percent` rounds the output before the write decision.
+    """
     rng = random.Random(SIM_SEED)  # noqa: S311 - seeded for a repeatable run
     controller = PIController(gains)
     temperature = TARGET
@@ -243,14 +281,19 @@ def simulate(gains: PIGains) -> SimulationResult:
     for step in range(total_steps):
         reading = temperature + rng.uniform(-SENSOR_NOISE, SENSOR_NOISE)
         output = controller.step(TARGET, reading, STEP, integrate=True)
+        if whole_percent:
+            output = float(round(output))
         measured = step >= warmup_steps
         if should_write_valve(output, valve, MIN_CHANGE):
-            valve = output
+            valve = trv(output)
             writes += measured
         for substep in range(substeps):
             elapsed = step * STEP + substep * SIM_SUBSTEP
             hour_of_day = (elapsed.total_seconds() / SECONDS_PER_HOUR) % HOURS_PER_DAY
-            temperature += _room_drift(hour_of_day, temperature, valve) * substep_hours
+            temperature += (
+                _room_drift(hour_of_day, temperature, valve, outdoor_mean)
+                * substep_hours
+            )
         if measured:
             abs_errors.append(abs(TARGET - temperature))
 
@@ -269,4 +312,16 @@ def test_simulated_week_stays_within_write_budget() -> None:
         f"Kp={SIM_KP} Ti={SIM_TI}: {result.writes_per_day:.1f} writes/day, "
         f"MAE {result.mean_abs_error:.3f} °C"
     )
+    assert result.writes_per_day < WRITES_PER_DAY_LIMIT
+
+
+def test_simulated_week_with_off_by_one_endpoints_stays_within_budget() -> None:
+    """A TRV reading 1 and 98 after writes of 0 and 99 is not rewritten every step."""
+    result = simulate(
+        PIGains(kp=SIM_KP, ti=SIM_TI),
+        _off_by_one_endpoint_trv,
+        whole_percent=True,
+        outdoor_mean=WARM_OUTDOOR_MEAN,
+    )
+
     assert result.writes_per_day < WRITES_PER_DAY_LIMIT

@@ -10,6 +10,9 @@ if TYPE_CHECKING:
 VALVE_MIN: Final = 0.0
 # Z-Wave Switch Multilevel tops out at 99, which the Spirit treats as fully open.
 VALVE_MAX: Final = 99.0
+# % points a TRV may read back off an endpoint and still count as there; without
+# it a valve reporting 1 after a write of 0 would be rewritten every step.
+ENDPOINT_TOLERANCE: Final = 2.0
 
 _INTEGRAL_KEY: Final = "integral"
 
@@ -70,5 +73,5 @@ class PIController:
 def should_write_valve(output: float, readback: float, min_change: float) -> bool:
     """Return whether a TRV whose valve reads back `readback` needs `output`."""
     if output in (VALVE_MIN, VALVE_MAX):
-        return readback != output
+        return abs(output - readback) > ENDPOINT_TOLERANCE
     return abs(output - readback) >= min_change
