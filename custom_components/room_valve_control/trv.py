@@ -24,6 +24,16 @@ class Trv(Protocol):
     """
 
     @property
+    def name(self) -> str:
+        """Return a stable identifier for logs."""
+        ...
+
+    @property
+    def max_offset(self) -> float:
+        """Return the largest offset magnitude in °C the device applies."""
+        ...
+
+    @property
     def available(self) -> bool:
         """Return whether the device can be read and written."""
         ...

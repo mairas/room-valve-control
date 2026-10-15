@@ -240,6 +240,25 @@ async def test_reads_device_state(hass: HomeAssistant) -> None:
     assert trv.own_temperature == pytest.approx(21.7)
 
 
+async def test_name_follows_climate_entity_id(
+    hass: HomeAssistant, full_spirit: Spirit
+) -> None:
+    """The TRV is named by its climate entity's current id."""
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    assert trv.name == CLIMATE_ID
+
+    full_spirit.entity_registry.async_update_entity(
+        CLIMATE_ID, new_entity_id="climate.renamed"
+    )
+    assert trv.name == "climate.renamed"
+
+
+@pytest.mark.usefixtures("full_spirit")
+async def test_max_offset_is_parameter_8_limit(hass: HomeAssistant) -> None:
+    """The Spirit applies offsets up to 5.0 °C either way."""
+    assert SpiritTrv(hass, CLIMATE_ID).max_offset == pytest.approx(5.0)
+
+
 @pytest.mark.usefixtures("full_spirit")
 async def test_mode_direct_with_preset_and_unknown_hvac_mode(
     hass: HomeAssistant,
