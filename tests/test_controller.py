@@ -108,11 +108,52 @@ def test_saturation_low_stops_integrator() -> None:
 
 def test_saturated_integrator_unwinds_toward_range() -> None:
     """Saturated high, an error pulling back into range still integrates."""
-    controller = PIController(GAINS, integral=120.0)
+    controller = PIController(GAINS, integral=VALVE_MAX)
 
     controller.step(TARGET, TARGET + 0.1, STEP, integrate=True)
 
-    assert controller.integral < 120.0  # noqa: PLR2004
+    assert controller.integral < VALVE_MAX
+
+
+def test_restored_low_integrator_unwinds_upward() -> None:
+    """A stored integral below 0 starts at 0 and a positive error moves it up."""
+    controller = PIController.from_dict(GAINS, {"integral": -20.0})
+
+    controller.step(TARGET, TARGET - 0.1, STEP, integrate=True)
+
+    assert controller.integral > VALVE_MIN
+
+
+def test_long_step_keeps_integrator_in_range() -> None:
+    """One long step cannot wind the integrator past the valve range."""
+    controller = PIController(GAINS, integral=60.0)
+
+    controller.step(TARGET, TARGET - 0.3, timedelta(hours=10), integrate=True)
+
+    assert controller.integral <= VALVE_MAX
+
+
+@pytest.mark.parametrize("elapsed", [timedelta(0), timedelta(minutes=-15)])
+def test_non_positive_elapsed_does_not_integrate(elapsed: timedelta) -> None:
+    """A zero or backwards time step leaves the integrator alone."""
+    controller = PIController(GAINS, integral=42.0)
+
+    controller.step(TARGET, TARGET - 0.5, elapsed, integrate=True)
+
+    assert controller.integral == 42.0  # noqa: PLR2004
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"), [(150.0, VALVE_MAX), (-20.0, VALVE_MIN), (37, 37.0)]
+)
+def test_from_dict_restores_integral_within_range(
+    stored: float, expected: float
+) -> None:
+    """A stored integral, integer or out of range, restores inside the valve range."""
+    controller = PIController.from_dict(GAINS, {"integral": stored})
+
+    assert controller.integral == expected
+    assert isinstance(controller.integral, float)
 
 
 def test_integration_not_allowed_freezes_integrator() -> None:
