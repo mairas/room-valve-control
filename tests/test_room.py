@@ -89,10 +89,12 @@ class FakeTrv:
             self.mode = TrvMode.DIRECT
         return self.sends
 
-    async def enter_self_regulation(self, setpoint: float) -> int:
-        """Record heat mode, then setpoint, writing only what differs."""
+    async def enter_self_regulation(
+        self, setpoint: float, *, force_mode: bool = False
+    ) -> int:
+        """Record heat mode, then setpoint, writing only what differs unless forced."""
         sent = 0
-        if self.mode is not TrvMode.SELF_REGULATING:
+        if force_mode or self.mode is not TrvMode.SELF_REGULATING:
             self.calls.append(("heat",))
             await self._wait_for_gate()
             if not self.sends:
@@ -102,7 +104,7 @@ class FakeTrv:
                 return 1
             self.mode = TrvMode.SELF_REGULATING
             sent += 1
-        if self.setpoint != setpoint:
+        if force_mode or self.setpoint != setpoint:
             self.calls.append(("setpoint", setpoint))
             await self._wait_for_gate()
             if self.sends:
