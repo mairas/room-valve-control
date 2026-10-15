@@ -11,10 +11,11 @@ from homeassistant.config_entries import RELOAD_AFTER_UPDATE_DELAY, ConfigEntryS
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     ATTR_TEMPERATURE,
+    EVENT_HOMEASSISTANT_STARTED,
     EVENT_HOMEASSISTANT_STOP,
     STATE_UNKNOWN,
 )
-from homeassistant.core import callback
+from homeassistant.core import CoreState, callback
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -67,6 +68,8 @@ RENAMED_SENSOR: Final = "sensor.lounge_temperature"
 LOWER_READING: Final = "19.5"
 LOWER_OUTPUT: Final = 45
 CHANGED_KP: Final = 40.0
+# 1 °C below TARGET at CHANGED_KP, nothing integrated on a new room's first step.
+CHANGED_KP_OUTPUT: Final = 40
 OTHER_SENSOR: Final = "sensor.living_room_window_temperature"
 RENAMED_CLIMATE: Final = "climate.lounge"
 INTEGRATOR_SENSOR: Final = "sensor.living_room_integrator"
@@ -164,14 +167,16 @@ async def test_fresh_reading_steps_at_once(
     assert calls == entering_direct()
 
 
-async def test_reading_from_before_the_start_is_not_used(
+async def test_reading_from_before_core_started_is_not_used(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory, calls: list[TrvCall]
 ) -> None:
-    """A state restored or retained before the room started is not a reading."""
-    hass.states.async_set(WALL_SENSOR, READING)
-    freezer.tick(timedelta(seconds=1))
+    """A state reported while Core starts may be restored or retained: not used."""
+    hass.set_state(CoreState.starting)
     await async_setup_room(hass)
+    hass.states.async_set(WALL_SENSOR, READING)
     await async_set_room_target(hass, TARGET)
+    freezer.tick(timedelta(seconds=1))
+    await _async_core_started(hass)
     mode = hass.states.get(MODE_SENSOR)
     assert mode is not None
     assert mode.state == "waiting"
@@ -183,12 +188,37 @@ async def test_reading_from_before_the_start_is_not_used(
     assert calls == entering_direct()
 
 
+async def test_room_steps_when_core_has_started(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,  # noqa: ARG001
+    calls: list[TrvCall],
+) -> None:
+    """A reading reported as Core finishes starting is used at once."""
+    hass.set_state(CoreState.starting)
+    await async_setup_room(hass)
+    await async_set_room_target(hass, TARGET)
+    # With time frozen, reported at the instant Core reaches running.
+    hass.states.async_set(WALL_SENSOR, READING)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert calls == []
+
+    await _async_core_started(hass)
+
+    assert calls == entering_direct()
+
+
+async def _async_core_started(hass: HomeAssistant) -> None:
+    hass.set_state(CoreState.running)
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+
 async def test_reading_change_in_direct_waits_for_next_step(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory, calls: list[TrvCall]
 ) -> None:
     """In direct mode a new reading takes effect at the periodic step."""
-    await async_setup_room(hass)
     hass.states.async_set(WALL_SENSOR, READING)
+    await async_setup_room(hass)
     await async_set_room_target(hass, TARGET)
     calls.clear()
 
@@ -206,8 +236,8 @@ async def test_unchanged_value_reported_after_fallback_steps_back_to_direct(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory, calls: list[TrvCall]
 ) -> None:
     """A sensor back with its old value only reports, which still steps at once."""
-    await async_setup_room(hass)
     hass.states.async_set(WALL_SENSOR, READING)
+    await async_setup_room(hass)
     await async_set_room_target(hass, TARGET)
     while ("set_hvac_mode", TRVS[0].climate, "heat") not in calls:
         await async_advance(hass, freezer)
@@ -236,8 +266,8 @@ async def test_unload_hands_back_every_trv(
     hass: HomeAssistant, calls: list[TrvCall]
 ) -> None:
     """Unloading puts every TRV in heat mode at the room target."""
-    entry = await async_setup_room(hass)
     hass.states.async_set(WALL_SENSOR, READING)
+    entry = await async_setup_room(hass)
     await async_set_room_target(hass, TARGET)
     calls.clear()
 
@@ -251,8 +281,8 @@ async def test_stop_hands_back_before_the_stop_event(
     hass: HomeAssistant, calls: list[TrvCall]
 ) -> None:
     """Core stop hands the TRVs back before zwave_js disconnects on the stop event."""
-    await async_setup_room(hass)
     hass.states.async_set(WALL_SENSOR, READING)
+    await async_setup_room(hass)
     await async_set_room_target(hass, TARGET)
     calls.clear()
     at_stop_event: list[TrvCall] = []
@@ -277,8 +307,8 @@ async def test_stop_hand_back_is_bounded(
     """At Core stop a TRV that never answers is cut off at the hand back bound."""
     calls: list[TrvCall] = []
     trvs = await async_setup_spirits(hass, calls)
-    await async_setup_room(hass)
     hass.states.async_set(WALL_SENSOR, READING)
+    await async_setup_room(hass)
     await async_set_room_target(hass, TARGET)
     stall = asyncio.Event()
     trvs[0].stall = stall
@@ -322,8 +352,8 @@ async def test_stop_hands_back_past_a_stalled_step(
     """Core stop cancels a step stalled on a TRV and still stops the room."""
     calls: list[TrvCall] = []
     trvs = await async_setup_spirits(hass, calls)
-    await async_setup_room(hass)
     hass.states.async_set(WALL_SENSOR, READING)
+    await async_setup_room(hass)
     stall = asyncio.Event()
     trvs[1].stall_valve = stall
     trvs[1].stall = stall
@@ -362,8 +392,8 @@ async def test_unload_hands_back_past_a_stalled_step(
     """Unload cancels a stalled step and hands every TRV back, with no deadline."""
     calls: list[TrvCall] = []
     trvs = await async_setup_spirits(hass, calls)
-    entry = await async_setup_room(hass)
     hass.states.async_set(WALL_SENSOR, READING)
+    entry = await async_setup_room(hass)
     stall = asyncio.Event()
     trvs[1].stall_valve = stall
     await _async_stall_the_first_step(hass, calls)
@@ -385,8 +415,8 @@ async def test_target_shows_while_a_step_is_stalled(hass: HomeAssistant) -> None
     """The thermostat echoes a new target without waiting for a stalled step."""
     calls: list[TrvCall] = []
     trvs = await async_setup_spirits(hass, calls)
-    await async_setup_room(hass)
     hass.states.async_set(WALL_SENSOR, READING)
+    await async_setup_room(hass)
     stall = asyncio.Event()
     trvs[1].stall_valve = stall
     await _async_stall_the_first_step(hass, calls)
@@ -500,10 +530,10 @@ async def test_removed_wall_sensor_is_dropped(
     """A wall sensor that no longer exists is logged and the others are used."""
     gone = register_sensor(hass, OTHER_SENSOR)
     er.async_get(hass).async_remove(OTHER_SENSOR)
+    hass.states.async_set(WALL_SENSOR, READING)
 
     with caplog.at_level(logging.WARNING):
         await async_setup_room(hass, sensors=[gone, *registry_ids(hass, [WALL_SENSOR])])
-    hass.states.async_set(WALL_SENSOR, READING)
     await async_set_room_target(hass, TARGET)
 
     assert gone in caplog.text
@@ -514,8 +544,8 @@ async def test_renamed_wall_sensor_reloads_the_room(
     hass: HomeAssistant, calls: list[TrvCall]
 ) -> None:
     """A wall sensor given a new entity id is read under it after a reload."""
-    await async_setup_room(hass)
     hass.states.async_set(WALL_SENSOR, READING)
+    await async_setup_room(hass)
     await async_set_room_target(hass, TARGET)
 
     er.async_get(hass).async_update_entity(WALL_SENSOR, new_entity_id=RENAMED_SENSOR)
@@ -562,8 +592,8 @@ async def test_climate_entity_going_away_hands_back(
     change: str,
 ) -> None:
     """Disabling or removing the room thermostat hands its TRVs back for good."""
-    await async_setup_room(hass)
     hass.states.async_set(WALL_SENSOR, READING)
+    await async_setup_room(hass)
     await async_set_room_target(hass, TARGET)
     calls.clear()
     registry = er.async_get(hass)
@@ -587,12 +617,38 @@ async def test_climate_entity_going_away_hands_back(
     assert calls == handing_back()
 
 
+async def test_reload_keeps_the_reading(
+    hass: HomeAssistant, calls: list[TrvCall]
+) -> None:
+    """A reloaded room steps on the reading it had, without waiting for a report."""
+    entry = await async_setup_room(hass)
+    hass.states.async_set(WALL_SENSOR, READING)
+    await async_set_room_target(hass, TARGET)
+    calls.clear()
+    subentry = entry.subentries[ROOM_ID]
+
+    hass.config_entries.async_update_subentry(
+        entry, subentry, data={**subentry.data, CONF_KP: CHANGED_KP}
+    )
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    # The offsets are already right; only the mode and valve are written.
+    assert calls == handing_back() + [
+        call
+        for ids in TRVS
+        for call in (
+            ("set_preset_mode", ids.climate, DIRECT_MODE_PRESET),
+            ("set_value", ids.valve, CHANGED_KP_OUTPUT),
+        )
+    ]
+
+
 async def test_reenabled_thermostat_restores_the_hand_back_writes(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory, calls: list[TrvCall]
 ) -> None:
     """The write counter saved on disabling includes the hand back's writes."""
-    await async_setup_room(hass)
     hass.states.async_set(WALL_SENSOR, READING)
+    await async_setup_room(hass)
     await async_set_room_target(hass, TARGET)
     registry = er.async_get(hass)
     registry.async_update_entity(
@@ -614,8 +670,8 @@ async def test_reload_hands_back_once(
     hass: HomeAssistant, calls: list[TrvCall]
 ) -> None:
     """A room change reloads the entry, which hands each TRV back once."""
-    entry = await async_setup_room(hass)
     hass.states.async_set(WALL_SENSOR, READING)
+    entry = await async_setup_room(hass)
     await async_set_room_target(hass, TARGET)
     calls.clear()
     subentry = entry.subentries[ROOM_ID]
@@ -642,10 +698,7 @@ async def test_stop_after_reload_hands_back_once(
         entry, subentry, data={**subentry.data, CONF_KP: CHANGED_KP}
     )
     await hass.async_block_till_done(wait_background_tasks=True)
-    calls.clear()
-    hass.states.async_set(WALL_SENSOR, READING, force_update=True)
-    await hass.async_block_till_done(wait_background_tasks=True)
-    assert ("set_preset_mode", TRVS[0].climate, DIRECT_MODE_PRESET) in calls
+    assert calls[-1] == ("set_value", TRVS[1].valve, CHANGED_KP_OUTPUT)
     calls.clear()
 
     await hass.async_stop()
@@ -658,8 +711,8 @@ async def test_reload_does_not_integrate_a_step(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory
 ) -> None:
     """A room reloaded with new gains resumes from the integral it had."""
-    entry = await async_setup_room(hass)
     hass.states.async_set(WALL_SENSOR, READING)
+    entry = await async_setup_room(hass)
     await async_set_room_target(hass, TARGET)
     await async_advance(hass, freezer)
     integrator = hass.states.get(INTEGRATOR_SENSOR)
@@ -688,8 +741,8 @@ async def test_target_set_during_reload_is_kept(hass: HomeAssistant) -> None:
     """A target set while a reload hands back is what the reloaded room runs at."""
     calls: list[TrvCall] = []
     trvs = await async_setup_spirits(hass, calls)
-    entry = await async_setup_room(hass)
     hass.states.async_set(WALL_SENSOR, READING)
+    entry = await async_setup_room(hass)
     await async_set_room_target(hass, TARGET)
     stall = asyncio.Event()
     trvs[0].stall = stall
@@ -718,8 +771,8 @@ async def test_renamed_climate_entity_keeps_the_room_running(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory, calls: list[TrvCall]
 ) -> None:
     """A new entity id re-adds the thermostat without handing the TRVs back."""
-    await async_setup_room(hass)
     hass.states.async_set(WALL_SENSOR, READING)
+    await async_setup_room(hass)
     await async_set_room_target(hass, TARGET)
     calls.clear()
 
