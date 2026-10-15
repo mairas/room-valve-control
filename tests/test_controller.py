@@ -229,9 +229,9 @@ def test_from_dict_rejects_malformed_state(data: dict[str, object]) -> None:
         PIController.from_dict(GAINS, data)
 
 
-# Simulation: starting gains, to be updated when Unit 1 converts the old ones.
+# Simulation: the default gains.
 SIM_KP = 30.0
-SIM_TI = timedelta(hours=2)
+SIM_TI = timedelta(minutes=30)
 SIM_SEED = 20261016
 SIM_WARMUP = timedelta(days=1)
 SIM_DURATION = timedelta(days=7)
