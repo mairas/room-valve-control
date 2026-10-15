@@ -1,11 +1,11 @@
 """Per-room PI control law and the per-TRV valve write decision."""
 
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import TYPE_CHECKING, Final, Self
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-    from datetime import timedelta
 
 VALVE_MIN: Final = 0.0
 # Z-Wave Switch Multilevel tops out at 99, which the Spirit treats as fully open.
@@ -31,7 +31,7 @@ class PIController:
     def __init__(self, gains: PIGains, integral: float = 0.0) -> None:
         """Create a controller, resuming from a previous integrator value."""
         self._gains = gains
-        self._integral = integral
+        self._integral = _clamp_to_valve_range(integral)
 
     @property
     def integral(self) -> float:
@@ -44,12 +44,14 @@ class PIController:
         """Return the valve output for this step and advance the integrator."""
         error = target - reading
         unclamped = self._gains.kp * error + self._integral
-        output = min(max(unclamped, VALVE_MIN), VALVE_MAX)
+        output = _clamp_to_valve_range(unclamped)
         pushing_past_max = unclamped >= VALVE_MAX and error > 0
         pushing_past_min = unclamped <= VALVE_MIN and error < 0
-        if integrate and not (pushing_past_max or pushing_past_min):
-            self._integral += (
-                self._gains.kp
+        moving_forward = elapsed > timedelta(0)
+        if integrate and moving_forward and not (pushing_past_max or pushing_past_min):
+            self._integral = _clamp_to_valve_range(
+                self._integral
+                + self._gains.kp
                 * error
                 * elapsed.total_seconds()
                 / self._gains.ti.total_seconds()
@@ -68,6 +70,10 @@ class PIController:
             msg = f"stored {_INTEGRAL_KEY} is not a number: {integral!r}"
             raise TypeError(msg)
         return cls(gains, float(integral))
+
+
+def _clamp_to_valve_range(value: float) -> float:
+    return min(max(value, VALVE_MIN), VALVE_MAX)
 
 
 def should_write_valve(output: float, readback: float, min_change: float) -> bool:
