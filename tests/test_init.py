@@ -52,6 +52,7 @@ TARGET: Final = 21.0
 READING: Final = "20.0"
 OUTPUT: Final = 30
 OFFSET_TENTHS: Final = -5
+OTHER_TARGET: Final = 22.0
 RELOAD_DELAY: Final = timedelta(seconds=RELOAD_AFTER_UPDATE_DELAY + 1)
 # Off the TRVs' own setpoint, so a fallback step writes it.
 FALLBACK_TARGET: Final = 20.5
@@ -504,6 +505,37 @@ async def test_reload_does_not_integrate_a_step(
     assert integrator is not None
     assert mode.state == "direct"
     assert float(integrator.state) == pytest.approx(integral)
+
+
+@pytest.mark.usefixtures("zwave_js_flow")
+async def test_target_set_during_reload_is_kept(hass: HomeAssistant) -> None:
+    """A target set while a reload hands back is what the reloaded room runs at."""
+    calls: list[TrvCall] = []
+    trvs = await async_setup_spirits(hass, calls)
+    hass.states.async_set(WALL_SENSOR, READING)
+    entry = await async_setup_room(hass)
+    await async_set_room_target(hass, TARGET)
+    stall = asyncio.Event()
+    trvs[0].stall = stall
+    subentry = entry.subentries[ROOM_ID]
+    hass.config_entries.async_update_subentry(
+        entry, subentry, data={**subentry.data, CONF_KP: 40.0}
+    )
+    await async_wait_for(lambda: ("set_hvac_mode", TRVS[0].climate, "heat") in calls)
+
+    await hass.services.async_call(
+        "climate",
+        "set_temperature",
+        {ATTR_ENTITY_ID: ROOM_CLIMATE, ATTR_TEMPERATURE: OTHER_TARGET},
+        blocking=True,
+    )
+    stall.set()
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    state = hass.states.get(ROOM_CLIMATE)
+    assert state is not None
+    assert state.attributes[ATTR_TEMPERATURE] == OTHER_TARGET
+    assert ("set_temperature", TRVS[1].climate, TARGET) in calls
 
 
 async def test_renamed_climate_entity_keeps_the_room_running(
