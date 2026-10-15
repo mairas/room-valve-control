@@ -182,6 +182,8 @@ def _trv_error(
                     "entity": err.entity,
                     "entity_id": str(err.entity_id),
                 }
+            if err.no_device:
+                return "trv_no_device", {"trv": trv}
             return "trv_entity_missing", {"trv": trv, "entity": err.entity}
     return None
 
