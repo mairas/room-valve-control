@@ -21,6 +21,7 @@ from custom_components.room_valve_control.spirit import (
 from custom_components.room_valve_control.trv import TrvMode
 
 if TYPE_CHECKING:
+    from freezegun.api import FrozenDateTimeFactory
     from homeassistant.core import HomeAssistant, ServiceCall
 
 ZWAVE_JS: Final = "zwave_js"
@@ -635,3 +636,22 @@ async def test_set_valve_needs_valve_entity_state(
 
     assert not await trv.set_valve(50)
     assert calls == []
+
+
+@pytest.mark.usefixtures("full_spirit")
+async def test_own_temperature_waits_for_report_after_offset_write(
+    hass: HomeAssistant, calls: list[ServiceCall], freezer: FrozenDateTimeFactory
+) -> None:
+    """The reported temperature includes a new offset only once re-reported."""
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    assert trv.own_temperature is not None
+
+    freezer.tick(1)
+    assert await trv.set_offset(0.5)
+    assert len(calls) == 1
+    hass.states.async_set(OFFSET_ID, "5.0")
+    assert trv.own_temperature is None
+
+    freezer.tick(1)
+    set_climate(hass, "heat")
+    assert trv.own_temperature == pytest.approx(CURRENT_TEMPERATURE - 0.5)

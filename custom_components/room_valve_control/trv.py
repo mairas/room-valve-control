@@ -45,7 +45,11 @@ class Trv(Protocol):
 
     @property
     def own_temperature(self) -> float | None:
-        """Return the TRV's own temperature reading in °C, without its offset."""
+        """
+        Return the TRV's own temperature reading in °C, without its offset.
+
+        None after an offset write until the TRV reports with the new offset.
+        """
         ...
 
     @property

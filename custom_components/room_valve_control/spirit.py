@@ -26,10 +26,13 @@ from homeassistant.core import Event, EventStateChangedData, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.util import dt as dt_util
 
 from .trv import TrvMode
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from homeassistant.core import HomeAssistant
 
 _LOGGER = logging.getLogger(__name__)
@@ -150,6 +153,7 @@ class SpiritTrv:
         """Find the TRV's entities; raise SpiritEntityError if one is unusable."""
         self._hass = hass
         self._setpoint_pending = False
+        self._offset_written_at: datetime | None = None
         registry = er.async_get(hass)
         climate = _usable(
             SpiritEntity.CLIMATE,
@@ -236,7 +240,19 @@ class SpiritTrv:
 
     @property
     def own_temperature(self) -> float | None:
-        """Return the TRV's reading without its offset."""
+        """
+        Return the TRV's reading without its offset.
+
+        None until the climate entity reports again after an offset write: the
+        Spirit re-reports its temperature, which includes the offset, only
+        minutes later. Any climate state write counts as a report.
+        """
+        state = self._hass.states.get(self.climate_entity_id)
+        if state is None or (
+            self._offset_written_at is not None
+            and state.last_reported <= self._offset_written_at
+        ):
+            return None
         reported = self._climate_attribute(ATTR_CURRENT_TEMPERATURE)
         offset = self.offset
         if reported is None or offset is None:
@@ -334,7 +350,7 @@ class SpiritTrv:
 
     async def set_offset(self, offset: float) -> bool:
         """Write parameter 8, clamped to ±5.0 °C in 0.1 °C steps."""
-        return await self._call(
+        sent = await self._call(
             ZWAVE_JS_DOMAIN,
             SERVICE_SET_CONFIG_PARAMETER,
             {
@@ -343,6 +359,9 @@ class SpiritTrv:
                 ATTR_CONFIG_VALUE: offset_to_tenths(offset),
             },
         )
+        if sent:
+            self._offset_written_at = dt_util.utcnow()
+        return sent
 
     def _climate_attribute(self, attribute: str) -> float | None:
         state = self._hass.states.get(self.climate_entity_id)
