@@ -553,6 +553,33 @@ async def test_renamed_trv_stays_in_use(hass: HomeAssistant) -> None:
     assert placeholders["room"] == "Living room"
 
 
+async def test_rejected_reconfigure_keeps_submitted_values(
+    hass: HomeAssistant,
+) -> None:
+    """A reconfigure refused for a parameter shows the values the user entered."""
+    entry = await _add_entry(hass, [_room(hass, "Bedroom", [TRV_1])])
+    stored = dict(entry.subentries[next(iter(entry.subentries))].data)
+
+    submitted = _room_input(**{CONF_KP: 0, CONF_MIN_CHANGE: 10})
+
+    result = await _reconfigure_room(hass, entry, submitted)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+    assert result["errors"] == {CONF_KP: "not_positive"}
+    for field in (CONF_KP, CONF_MIN_CHANGE, CONF_TRVS):
+        assert _suggested(result, field) == submitted[field]
+    (subentry,) = entry.subentries.values()
+    assert dict(subentry.data) == stored
+
+
+def _suggested(result: SubentryFlowResult, field: str) -> Any:
+    schema = result["data_schema"]
+    assert schema is not None
+    key = next(key for key in schema.schema if key == field)
+    return key.description["suggested_value"]
+
+
 def _config_subentry(hass: HomeAssistant, title: str, trv: str) -> ConfigSubentry:
     return ConfigSubentry(
         data=MappingProxyType(_room_data(hass, [trv])),
@@ -572,7 +599,7 @@ def test_strings_match_english_translation() -> None:
 
 @pytest.mark.parametrize("step_id", ["user", "reconfigure"])
 async def test_room_form_is_translated(hass: HomeAssistant, step_id: str) -> None:
-    """Every room field and error has an English label."""
+    """Every room field has a label and a description, every error a text."""
     entry = await _add_entry(hass, [_room(hass, "Bedroom", [TRV_1])])
     (subentry_id,) = entry.subentries
     result = await hass.config_entries.subentries.async_init(
@@ -585,9 +612,13 @@ async def test_room_form_is_translated(hass: HomeAssistant, step_id: str) -> Non
     prefix = f"component.{DOMAIN}.config_subentries.{SUBENTRY_TYPE_ROOM}"
 
     schema = result["data_schema"]
+    placeholders = result["description_placeholders"]
     assert schema is not None
+    assert placeholders is not None
     for field in schema.schema:
         assert f"{prefix}.step.{step_id}.data.{field}" in translations
+        description = translations[f"{prefix}.step.{step_id}.data_description.{field}"]
+        assert "{" not in description.format(**placeholders)
     for error in ERROR_KEYS:
         assert f"{prefix}.error.{error}" in translations
     assert f"{prefix}.abort.reconfigure_successful" in translations
