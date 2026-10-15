@@ -9,9 +9,16 @@ if TYPE_CHECKING:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:  # noqa: ARG001
     """Set up Room Valve Control from a config entry."""
+    # HA has no per-subentry reload, so adding, changing or removing a room
+    # reloads the whole entry.
+    entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:  # noqa: ARG001
     """Unload a config entry."""
     return True
+
+
+async def _async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    hass.config_entries.async_schedule_reload(entry.entry_id)
