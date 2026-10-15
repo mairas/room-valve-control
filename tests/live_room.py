@@ -108,6 +108,12 @@ class FakeSpiritClimate(ClimateEntity):
         self.stall: asyncio.Event | None = None
         # While set, writes to the valve number hang until it is.
         self.stall_valve: asyncio.Event | None = None
+        # While set, a preset write is applied only once it is, even if the
+        # caller has given up: the node already has the command.
+        self.stall_preset: asyncio.Event | None = None
+        # A preset change not applied yet; the node applies later commands
+        # after it, as zwave-js sends a node's commands in order.
+        self._pending_preset: asyncio.Task[None] | None = None
         self.entity_id = ids.climate
         self._attr_unique_id = value_unique_id(
             ids.node_id, COMMAND_CLASS_THERMOSTAT_MODE, "mode"
@@ -136,12 +142,32 @@ class FakeSpiritClimate(ClimateEntity):
     @override
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         self._calls.append(("set_preset_mode", self.entity_id, preset_mode))
+        stall = self.stall_preset
+        if stall is None:
+            self._apply_preset(preset_mode)
+            return
+
+        async def apply_later() -> None:
+            await stall.wait()
+            self._apply_preset(preset_mode)
+
+        self._pending_preset = self.hass.async_create_background_task(
+            apply_later(), f"{self.entity_id} preset"
+        )
+        await asyncio.shield(self._pending_preset)
+
+    async def _after_pending_preset(self) -> None:
+        if self._pending_preset is not None:
+            await asyncio.shield(self._pending_preset)
+
+    def _apply_preset(self, preset_mode: str) -> None:
         self._attr_preset_mode = preset_mode
         self.async_write_ha_state()
 
     @override
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         self._calls.append(("set_hvac_mode", self.entity_id, hvac_mode))
+        await self._after_pending_preset()
         if self.stall is not None:
             await self.stall.wait()
         self._attr_hvac_mode = hvac_mode
@@ -152,6 +178,7 @@ class FakeSpiritClimate(ClimateEntity):
     async def async_set_temperature(self, **kwargs: Any) -> None:
         temperature = kwargs[ATTR_TEMPERATURE]
         self._calls.append(("set_temperature", self.entity_id, temperature))
+        await self._after_pending_preset()
         self._attr_target_temperature = temperature
         self.async_write_ha_state()
 

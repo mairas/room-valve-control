@@ -411,6 +411,42 @@ async def test_unload_hands_back_past_a_stalled_step(
 
 
 @pytest.mark.usefixtures("zwave_js_flow")
+async def test_unload_during_a_preset_change_forces_heat(
+    hass: HomeAssistant,
+) -> None:
+    """A preset change the node applies after the hand back is overridden."""
+    calls: list[TrvCall] = []
+    trvs = await async_setup_spirits(hass, calls)
+    hass.states.async_set(WALL_SENSOR, READING)
+    entry = await async_setup_room(hass)
+    stall = asyncio.Event()
+    trvs[1].stall_preset = stall
+    await hass.services.async_call(
+        "climate",
+        "set_temperature",
+        {ATTR_ENTITY_ID: ROOM_CLIMATE, ATTR_TEMPERATURE: TARGET},
+        blocking=True,
+    )
+    await async_wait_for(
+        lambda: ("set_preset_mode", TRVS[1].climate, DIRECT_MODE_PRESET) in calls
+    )
+    calls.clear()
+
+    unload = hass.async_create_task(hass.config_entries.async_unload(entry.entry_id))
+    await async_wait_for(lambda: ("set_hvac_mode", TRVS[1].climate, "heat") in calls)
+    # The node applies the preset change before the queued heat mode.
+    stall.set()
+    assert await unload
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert ("set_temperature", TRVS[1].climate, TARGET) in calls
+    state = hass.states.get(TRVS[1].climate)
+    assert state is not None
+    assert state.state == "heat"
+    assert state.attributes["preset_mode"] != DIRECT_MODE_PRESET
+
+
+@pytest.mark.usefixtures("zwave_js_flow")
 async def test_target_shows_while_a_step_is_stalled(hass: HomeAssistant) -> None:
     """The thermostat echoes a new target without waiting for a stalled step."""
     calls: list[TrvCall] = []
