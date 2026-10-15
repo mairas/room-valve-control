@@ -1,0 +1,12 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "description": "Add Room Valve Control. Rooms are added to it afterwards."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Room Valve Control is already set up."
+    }
+  }
+}

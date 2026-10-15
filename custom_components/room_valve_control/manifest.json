@@ -1,0 +1,14 @@
+{
+  "domain": "room_valve_control",
+  "name": "Room Valve Control",
+  "after_dependencies": ["zwave_js"],
+  "codeowners": ["@mairas"],
+  "config_flow": true,
+  "documentation": "https://github.com/mairas/room-valve-control",
+  "integration_type": "hub",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/mairas/room-valve-control/issues",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "0.1.0"
+}
