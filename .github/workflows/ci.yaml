@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Lint, type check and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+
+      - name: Lint
+        run: ./run lint
+
+      - name: Type check
+        run: ./run typecheck
+
+      - name: Test
+        run: ./run test
+
+      - name: Build the release archive
+        run: |
+          ./run archive
+          unzip -l dist/room_valve_control.zip | grep -q 'custom_components/room_valve_control/manifest.json'
