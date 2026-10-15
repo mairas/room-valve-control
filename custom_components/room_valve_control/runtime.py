@@ -6,7 +6,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Final
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.core import CALLBACK_TYPE, CoreState, HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.event import (
     async_track_entity_registry_updated_event,
@@ -14,6 +14,7 @@ from homeassistant.helpers.event import (
     async_track_state_report_event,
     async_track_time_interval,
 )
+from homeassistant.helpers.start import async_at_started
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -81,7 +82,10 @@ class RoomRuntime:
         )
         self._trvs = trvs
         self.room: Room | None = None
-        self._started_at: datetime | None = None
+        # While Core starts, wall sensor states are restored or retained ones
+        # however old their value; readings count from when it has started.
+        self._core_started = False
+        self._readings_since: datetime | None = None
         # Keeps an immediate step's condition and the step together; Room
         # itself serializes its writes.
         self._step_lock = asyncio.Lock()
@@ -125,15 +129,15 @@ class RoomRuntime:
         """
         Return the wall sensors' numeric states and when they reported.
 
-        A state reported before the room started is left out: at Core start a
-        restored or retained state is reported then, however old its value.
+        None while Core is starting, and none reported before it had started.
         """
-        if self._started_at is None:
+        if not self._core_started:
             return []
+        since = self._readings_since
         readings = []
         for sensor_id in self._sensor_ids:
             state = self._hass.states.get(sensor_id)
-            if state is None or state.last_reported < self._started_at:
+            if state is None or (since is not None and state.last_reported < since):
                 continue
             try:
                 value = float(state.state)
@@ -158,12 +162,11 @@ class RoomRuntime:
     ) -> None:
         """Create the room from restored values, start stepping and step once."""
         controller = self._restore_controller(controller_state)
-        self._started_at = dt_util.utcnow()
         room = Room(
             self._settings,
             self._trvs,
             controller,
-            self._started_at,
+            dt_util.utcnow(),
             name=self.name,
             device_writes=device_writes,
         )
@@ -189,6 +192,18 @@ class RoomRuntime:
                 self._hass, self._sensor_ids, self._async_sensor_registry_updated
             ),
         ]
+        if self._hass.state is CoreState.running:
+            self._core_started = True
+        else:
+            self._unsubscribes.append(
+                async_at_started(self._hass, self._async_core_started)
+            )
+        self._schedule_step(None)
+
+    @callback
+    def _async_core_started(self, _hass: HomeAssistant) -> None:
+        self._core_started = True
+        self._readings_since = dt_util.utcnow()
         self._schedule_step(None)
 
     def _restore_controller(self, state: Mapping[str, object] | None) -> PIController:

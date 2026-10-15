@@ -64,8 +64,8 @@ async def test_thermostat_is_heat_only_on_the_room_device(
     hass: HomeAssistant, calls: list[TrvCall]
 ) -> None:
     """The thermostat sits on a device named after the room."""
-    await async_setup_room(hass)
     hass.states.async_set(WALL_SENSOR, LATER_READING)
+    await async_setup_room(hass)
 
     state = hass.states.get(ROOM_CLIMATE)
     assert state is not None
@@ -88,8 +88,8 @@ async def test_target_is_echoed_and_first_target_steps_at_once(
     hass: HomeAssistant, calls: list[TrvCall]
 ) -> None:
     """The first target acts at once; later ones wait for the step in direct."""
-    await async_setup_room(hass)
     hass.states.async_set(WALL_SENSOR, BELOW_TARGET)
+    await async_setup_room(hass)
 
     await async_set_room_target(hass, RESTORED_TARGET)
 
@@ -136,9 +136,7 @@ async def test_restart_restores_target_integrator_and_writes(
 
 
 async def test_start_step_after_restore_enters_direct(
-    hass: HomeAssistant,
-    freezer: FrozenDateTimeFactory,  # noqa: ARG001
-    calls: list[TrvCall],
+    hass: HomeAssistant, calls: list[TrvCall]
 ) -> None:
     """A restored target and a reading as the room starts write at once."""
     restore(
@@ -149,7 +147,6 @@ async def test_start_step_after_restore_enters_direct(
             "device_writes": RESTORED_WRITES,
         },
     )
-    # With time frozen, reported at the instant the room starts.
     hass.states.async_set(WALL_SENSOR, BELOW_TARGET)
 
     await async_setup_room(hass)
@@ -210,8 +207,8 @@ async def test_stored_state_round_trips(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory, calls: list[TrvCall]
 ) -> None:
     """What the thermostat stores is what the steps left behind."""
-    await async_setup_room(hass)
     hass.states.async_set(WALL_SENSOR, BELOW_TARGET)
+    await async_setup_room(hass)
     await async_set_room_target(hass, RESTORED_TARGET)
     await async_advance(hass, freezer)
 

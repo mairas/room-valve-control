@@ -93,8 +93,8 @@ async def test_sensors_show_the_step(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory, calls: list[TrvCall]
 ) -> None:
     """After direct steps the sensors show what they computed and wrote."""
-    await async_setup_room(hass)
     hass.states.async_set(WALL_SENSOR, READING)
+    await async_setup_room(hass)
     await async_set_room_target(hass, TARGET)
 
     await async_advance(hass, freezer)
