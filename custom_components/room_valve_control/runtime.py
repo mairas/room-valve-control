@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Final
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
@@ -54,20 +54,6 @@ type StepCondition = Callable[[datetime, Sequence[Reading]], bool]
 type RoomValveControlConfigEntry = ConfigEntry[dict[str, RoomRuntime]]
 
 
-def room_gains(data: Mapping[str, Any]) -> PIGains:
-    """Return the PI gains stored in a room subentry."""
-    return PIGains(kp=data[CONF_KP], ti=timedelta(seconds=data[CONF_TI]))
-
-
-def room_settings(data: Mapping[str, Any]) -> RoomSettings:
-    """Return the control parameters stored in a room subentry."""
-    return RoomSettings(
-        control_step=timedelta(seconds=data[CONF_CONTROL_STEP]),
-        min_valve_change=data[CONF_MIN_CHANGE],
-        stale_timeout=timedelta(seconds=data[CONF_STALE_TIMEOUT]),
-    )
-
-
 class RoomRuntime:
     """One room's TRVs and control state, stepped on a timer and on readings."""
 
@@ -86,8 +72,13 @@ class RoomRuntime:
         self.min_target: float = subentry.data[CONF_MIN_TARGET]
         self.max_target: float = subentry.data[CONF_MAX_TARGET]
         self._sensor_ids = self._wall_sensors(hass, subentry.data[CONF_SENSORS])
-        self._gains = room_gains(subentry.data)
-        self._settings = room_settings(subentry.data)
+        data = subentry.data
+        self._gains = PIGains(kp=data[CONF_KP], ti=timedelta(seconds=data[CONF_TI]))
+        self._settings = RoomSettings(
+            control_step=timedelta(seconds=data[CONF_CONTROL_STEP]),
+            min_valve_change=data[CONF_MIN_CHANGE],
+            stale_timeout=timedelta(seconds=data[CONF_STALE_TIMEOUT]),
+        )
         self._trvs = trvs
         self.room: Room | None = None
         self._started_at: datetime | None = None
