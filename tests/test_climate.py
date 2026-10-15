@@ -46,6 +46,9 @@ WRITES_SENSOR: Final = "sensor.living_room_device_writes"
 RESTORED_TARGET: Final = 20.8
 RESTORED_INTEGRAL: Final = 12.5
 RESTORED_WRITES: Final = 7
+MODE_SENSOR: Final = "sensor.living_room_control_mode"
+BELOW_TARGET: Final = "20.0"
+LATER_READING: Final = "20.4"
 
 
 def restore(hass: HomeAssistant, extra: dict[str, Any]) -> None:
@@ -127,6 +130,49 @@ async def test_restart_restores_target_integrator_and_writes(
     assert writes is not None
     assert float(integrator.state) == RESTORED_INTEGRAL
     assert int(writes.state) == RESTORED_WRITES
+    assert calls == []
+
+
+async def test_start_step_after_restore_enters_direct(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,  # noqa: ARG001
+    calls: list[TrvCall],
+) -> None:
+    """A restored target and a reading as the room starts write at once."""
+    restore(
+        hass,
+        {
+            "target": RESTORED_TARGET,
+            "controller": {"integral": RESTORED_INTEGRAL},
+            "device_writes": RESTORED_WRITES,
+        },
+    )
+    # With time frozen, reported at the instant the room starts.
+    hass.states.async_set(WALL_SENSOR, BELOW_TARGET)
+
+    await async_setup_room(hass)
+
+    assert {call[1] for call in calls} >= {ids.valve for ids in TRVS}
+    mode = hass.states.get(MODE_SENSOR)
+    assert mode is not None
+    assert mode.state == "direct"
+
+
+async def test_reading_updates_the_current_temperature(
+    hass: HomeAssistant, calls: list[TrvCall]
+) -> None:
+    """In direct mode a new reading shows at once, before the next step."""
+    await async_setup_room(hass)
+    hass.states.async_set(WALL_SENSOR, BELOW_TARGET)
+    await async_set_room_target(hass, RESTORED_TARGET)
+    calls.clear()
+
+    hass.states.async_set(WALL_SENSOR, LATER_READING)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    state = hass.states.get(ROOM_CLIMATE)
+    assert state is not None
+    assert state.attributes[ATTR_CURRENT_TEMPERATURE] == float(LATER_READING)
     assert calls == []
 
 
