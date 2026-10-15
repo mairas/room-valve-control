@@ -506,6 +506,9 @@ async def test_climate_entity_going_away_hands_back(
     await hass.async_block_till_done(wait_background_tasks=True)
     assert hass.states.get(ROOM_CLIMATE) is None
     assert calls == handing_back()
+    mode = hass.states.get(MODE_SENSOR)
+    assert mode is not None
+    assert mode.state == "stopped"
 
     # Disabling reloads the entry after a delay; the room stays handed back.
     await async_advance(hass, freezer, RELOAD_DELAY)
