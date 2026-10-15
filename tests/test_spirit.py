@@ -7,7 +7,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Final
 
 import pytest
-from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.const import EVENT_STATE_CHANGED, STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
@@ -23,6 +23,8 @@ from custom_components.room_valve_control.spirit import (
 from custom_components.room_valve_control.trv import TrvMode
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from freezegun.api import FrozenDateTimeFactory
     from homeassistant.core import HomeAssistant, ServiceCall
 
@@ -382,6 +384,79 @@ async def test_setpoint_waits_for_mode_change(
     assert [c.service for c in calls] == ["set_hvac_mode", "set_temperature"]
 
 
+def state_listeners(hass: HomeAssistant) -> int:
+    """Return how many listeners the bus has for state changes."""
+    return hass.bus.async_listeners().get(EVENT_STATE_CHANGED, 0)
+
+
+def on_mode_write(
+    hass: HomeAssistant, calls: list[ServiceCall], report: Callable[[], None]
+) -> list[int]:
+    """
+    Run report just after the heat mode write returns, once the wait began.
+
+    Return the state change listener counts seen then.
+    """
+    seen: list[int] = []
+
+    def report_while_waiting() -> None:
+        seen.append(state_listeners(hass))
+        report()
+
+    async def handler(call: ServiceCall) -> None:
+        calls.append(call)
+        hass.loop.call_soon(report_while_waiting)
+
+    hass.services.async_register("climate", "set_hvac_mode", handler)
+    return seen
+
+
+@pytest.mark.usefixtures("full_spirit", "short_mode_change_timeout")
+@pytest.mark.parametrize("switches", [True, False])
+async def test_mode_wait_leaves_no_listener(
+    hass: HomeAssistant,
+    calls: list[ServiceCall],
+    switches: bool,  # noqa: FBT001
+) -> None:
+    """The wait for heat mode unsubscribes whether it succeeds or times out."""
+
+    def report() -> None:
+        if switches:
+            set_climate(hass, "heat")
+        else:
+            set_climate(hass, "off")
+
+    seen = on_mode_write(hass, calls, report)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    set_climate(hass, STATE_UNKNOWN, preset=DIRECT_MODE_PRESET, setpoint=None)
+    before = state_listeners(hass)
+
+    assert await trv.enter_self_regulation(21.0) == (2 if switches else 1)
+    assert seen == [before + 1]
+    assert state_listeners(hass) == before
+
+
+@pytest.mark.usefixtures("full_spirit", "short_mode_change_timeout")
+async def test_climate_unavailable_during_mode_wait_defers_setpoint(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """An unavailable climate entity is waited out, and the setpoint kept pending."""
+    on_mode_write(
+        hass, calls, lambda: hass.states.async_set(CLIMATE_ID, STATE_UNAVAILABLE)
+    )
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    set_climate(hass, STATE_UNKNOWN, preset=DIRECT_MODE_PRESET, setpoint=None)
+
+    started = hass.loop.time()
+    assert await trv.enter_self_regulation(19.5) == 1
+    assert hass.loop.time() - started >= spirit.MODE_CHANGE_TIMEOUT
+    assert [c.service for c in calls] == ["set_hvac_mode"]
+
+    set_climate(hass, "heat", setpoint=19.5)
+    assert await trv.enter_self_regulation(19.5) == 1
+    assert [c.service for c in calls] == ["set_hvac_mode", "set_temperature"]
+
+
 @pytest.mark.usefixtures("full_spirit")
 async def test_failed_mode_write_skips_setpoint(
     hass: HomeAssistant, calls: list[ServiceCall]
@@ -444,7 +519,13 @@ async def test_enter_self_regulation_skips_what_already_matches(
 @pytest.mark.usefixtures("full_spirit")
 @pytest.mark.parametrize(
     ("requested", "step", "written"),
-    [(21.2, None, False), (21.2, 0.1, True), (21.5, None, True), (21.1, 0.1, True)],
+    [
+        (21.2, None, False),
+        (21.3, None, True),
+        (21.2, 0.1, True),
+        (21.5, None, True),
+        (21.1, 0.1, True),
+    ],
 )
 async def test_setpoint_matches_within_half_a_step(
     hass: HomeAssistant,
