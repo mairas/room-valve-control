@@ -237,6 +237,7 @@ SIM_WARMUP = timedelta(days=1)
 SIM_DURATION = timedelta(days=7)
 SIM_SUBSTEP = timedelta(minutes=1)
 WRITES_PER_DAY_LIMIT = 72
+MEAN_ABS_ERROR_LIMIT = 0.5  # °C
 
 ROOM_TIME_CONSTANT = timedelta(hours=8)
 HEATING_AT_FULL_VALVE = 4.0  # °C/h with the valve at 100 %
@@ -345,15 +346,19 @@ def simulate(
     )
 
 
-def test_simulated_week_stays_within_write_budget() -> None:
-    """A week of direct control at the starting gains stays under 72 writes/day."""
-    result = simulate(PIGains(kp=SIM_KP, ti=SIM_TI))
-
-    print(  # noqa: T201
+def _summary(result: SimulationResult) -> str:
+    return (
         f"Kp={SIM_KP} Ti={SIM_TI}: {result.writes_per_day:.1f} writes/day, "
         f"MAE {result.mean_abs_error:.3f} °C"
     )
-    assert result.writes_per_day < WRITES_PER_DAY_LIMIT
+
+
+def test_simulated_week_stays_within_write_budget() -> None:
+    """A week at the starting gains tracks the target within the write budget."""
+    result = simulate(PIGains(kp=SIM_KP, ti=SIM_TI))
+
+    assert result.writes_per_day < WRITES_PER_DAY_LIMIT, _summary(result)
+    assert result.mean_abs_error < MEAN_ABS_ERROR_LIMIT, _summary(result)
 
 
 def test_simulated_week_with_off_by_one_endpoints_stays_within_budget() -> None:
@@ -365,4 +370,4 @@ def test_simulated_week_with_off_by_one_endpoints_stays_within_budget() -> None:
         outdoor_mean=WARM_OUTDOOR_MEAN,
     )
 
-    assert result.writes_per_day < WRITES_PER_DAY_LIMIT
+    assert result.writes_per_day < WRITES_PER_DAY_LIMIT, _summary(result)
