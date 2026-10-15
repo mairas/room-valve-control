@@ -15,9 +15,15 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-# °C the TRV offset may lag the wanted one; finer updates would cost device
-# writes for a correction the TRV's own regulation barely notices.
-OFFSET_MIN_CHANGE: Final = 0.3
+# Tenths of a °C the TRV offset may lag the wanted one; finer updates would
+# cost device writes for a correction the TRV's own regulation barely notices.
+# Compared in whole tenths so a nominal 0.3 °C is not read as 0.2999...
+OFFSET_MIN_CHANGE_TENTHS: Final = 3
+TENTHS_PER_DEGREE: Final = 10
+
+
+def _tenths(degrees: float) -> int:
+    return round(degrees * TENTHS_PER_DEGREE)
 
 
 class ControlMode(StrEnum):
@@ -201,7 +207,10 @@ class Room:
         # Compared clamped: the readback can never exceed the device limit.
         limit = trv.max_offset
         wanted = max(-limit, min(limit, reading - trv.own_temperature))
-        if trv.offset is None or abs(wanted - trv.offset) >= OFFSET_MIN_CHANGE:
+        if (
+            trv.offset is None
+            or abs(_tenths(wanted) - _tenths(trv.offset)) >= OFFSET_MIN_CHANGE_TENTHS
+        ):
             self._device_writes += await trv.set_offset(wanted)
 
     async def _self_regulate(self, setpoint: float) -> None:

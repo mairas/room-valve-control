@@ -506,6 +506,19 @@ async def test_offset_written_when_it_moves_at_least_threshold(
     assert offset_calls == ([("offset", 0.5)] if written else [])
 
 
+async def test_offset_change_of_nominal_threshold_is_written() -> None:
+    """20.7 - 20.0 - 0.4 is 0.2999... in floats; in tenths it is the threshold."""
+    trv = FakeTrv(mode=TrvMode.DIRECT, valve=30.0, own_temperature=20.0, offset=0.4)
+    room = make_room([trv])
+    await room.set_target(TARGET)
+
+    await room.step(START, fresh(20.7, START))
+
+    assert [c for c in trv.calls if c[0] == "offset"] == [
+        ("offset", pytest.approx(0.7))
+    ]
+
+
 async def test_offset_beyond_device_limit_is_clamped_and_written_once() -> None:
     """A gap past the TRV's limit writes the limit, not the gap after every report."""
     trv = FakeTrv(mode=TrvMode.DIRECT, valve=30.0, own_temperature=26.0)
