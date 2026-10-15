@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from datetime import timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
@@ -54,9 +55,11 @@ _VALUE_ID_PARTS: Final = 4
 
 # The node status sensor's unique id is "<home id>.<node>.node_status"; it is
 # enabled by default and reads alive, asleep, awake, dead or unknown. zwave_js
-# keeps a dead node's value entities available.
+# keeps a dead node's value entities available, and marks the node alive only
+# once it hears from it, so writes to a dead node are throttled, not stopped.
 NODE_STATUS_UNIQUE_ID_SUFFIX: Final = ".node_status"
 NODE_STATUS_DEAD: Final = "dead"
+DEAD_NODE_RETRY_INTERVAL: Final = timedelta(minutes=30)
 
 # Seconds to wait for a blocking service call to an unresponsive node.
 SERVICE_TIMEOUT: Final = 30.0
@@ -166,6 +169,8 @@ class SpiritTrv:
         # When the last offset write went out, and the temperature then reported.
         self._offset_written_at: datetime | None = None
         self._temperature_at_offset_write: float | None = None
+        # When the last write was let through to a node reading dead.
+        self._dead_node_write_at: datetime | None = None
         registry = er.async_get(hass)
         climate = _usable(
             SpiritEntity.CLIMATE,
@@ -246,15 +251,30 @@ class SpiritTrv:
 
     @property
     def available(self) -> bool:
-        """Return whether the climate entity reports and the node is not dead."""
+        """Return whether the climate entity reports."""
         state = self._hass.states.get(self.climate_entity_id)
-        if state is None or state.state == STATE_UNAVAILABLE:
-            return False
+        return state is not None and state.state != STATE_UNAVAILABLE
+
+    def _node_dead(self) -> bool:
         if self._node_status_unique_id is None:
-            return True
+            return False
         status_id = self._entity_id(SENSOR_DOMAIN, self._node_status_unique_id, "")
         status = self._hass.states.get(status_id) if status_id else None
-        return status is None or status.state != NODE_STATUS_DEAD
+        return status is not None and status.state == NODE_STATUS_DEAD
+
+    def _dead_node_write_allowed(self) -> bool:
+        """Let one write per retry interval through to a node reading dead."""
+        if not self._node_dead():
+            self._dead_node_write_at = None
+            return True
+        now = dt_util.utcnow()
+        if (
+            self._dead_node_write_at is not None
+            and now - self._dead_node_write_at < DEAD_NODE_RETRY_INTERVAL
+        ):
+            return False
+        self._dead_node_write_at = now
+        return True
 
     @property
     def mode(self) -> TrvMode:
@@ -448,6 +468,14 @@ class SpiritTrv:
     async def _call(self, domain: str, service: str, data: dict[str, object]) -> bool:
         if not self.available:
             return False
+        if not self._dead_node_write_allowed():
+            _LOGGER.debug(
+                "%s: node is dead; write dropped: %s.%s",
+                self.climate_entity_id,
+                domain,
+                service,
+            )
+            return False
         try:
             async with asyncio.timeout(SERVICE_TIMEOUT):
                 await self._hass.services.async_call(
@@ -469,4 +497,5 @@ class SpiritTrv:
                 "%s: %s.%s failed: %s", self.climate_entity_id, domain, service, err
             )
             return False
+        self._dead_node_write_at = None
         return True

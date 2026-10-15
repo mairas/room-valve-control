@@ -1,7 +1,9 @@
 """Tests for the Eurotronic Spirit TRV adapter."""
 
 import asyncio
+import logging
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import TYPE_CHECKING, Final
 
 import pytest
@@ -566,31 +568,97 @@ async def test_failed_service_reports_not_sent(
     assert "set_config_parameter failed" in caplog.text
 
 
-@pytest.mark.parametrize(
-    ("status", "available"),
-    [("dead", False), ("alive", True), ("asleep", True), ("unknown", True)],
-)
-async def test_node_status_decides_availability(
-    hass: HomeAssistant,
-    full_spirit: Spirit,
-    calls: list[ServiceCall],
-    status: str,
-    available: bool,  # noqa: FBT001
-) -> None:
-    """A dead node is unavailable although its entities still report."""
+def failing_valve_writes(hass: HomeAssistant, calls: list[ServiceCall]) -> None:
+    """Make every valve write reach the service and fail, as to a dead node."""
+
+    async def fail(call: ServiceCall) -> None:
+        calls.append(call)
+        msg = "node is dead"
+        raise HomeAssistantError(msg)
+
+    hass.services.async_register("number", "set_value", fail)
+
+
+@pytest.fixture
+def node_status(hass: HomeAssistant, full_spirit: Spirit) -> None:
+    """Register the Spirit's node status sensor, reading dead."""
     _add_entity(full_spirit, "sensor", NODE_STATUS_UNIQUE_ID, NODE_STATUS_ID)
-    hass.states.async_set(NODE_STATUS_ID, status)
+    hass.states.async_set(NODE_STATUS_ID, "dead")
+
+
+@pytest.mark.usefixtures("node_status")
+async def test_dead_node_writes_are_throttled(
+    hass: HomeAssistant,
+    calls: list[ServiceCall],
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A dead node stays available but gets one write per retry interval."""
+    caplog.set_level(logging.DEBUG, logger=spirit.__name__)
+    failing_valve_writes(hass, calls)
     trv = SpiritTrv(hass, CLIMATE_ID)
 
-    assert trv.available is available
-    assert await trv.set_valve(50) is available
-    assert len(calls) == int(available)
+    assert trv.available
+    assert not await trv.set_valve(50)
+    assert len(calls) == 1
+
+    freezer.tick(spirit.DEAD_NODE_RETRY_INTERVAL - timedelta(seconds=1))
+    assert not await trv.set_valve(50)
+    assert len(calls) == 1
+    assert "node is dead; write dropped" in caplog.text
+
+    freezer.tick(timedelta(seconds=1))
+    assert not await trv.set_valve(50)
+    assert len(calls) == 2  # noqa: PLR2004
 
 
-async def test_disabled_node_status_falls_back_to_climate(
-    hass: HomeAssistant, full_spirit: Spirit
+@pytest.mark.usefixtures("node_status")
+async def test_successful_write_to_dead_node_resets_throttle(
+    hass: HomeAssistant, calls: list[ServiceCall]
 ) -> None:
-    """Without a node status reading, availability is the climate entity's."""
+    """A write that succeeds although the node reads dead lets the next one out."""
+    trv = SpiritTrv(hass, CLIMATE_ID)
+
+    assert await trv.set_valve(50)
+    assert await trv.set_valve(60)
+    assert len(calls) == 2  # noqa: PLR2004
+
+
+@pytest.mark.usefixtures("node_status")
+async def test_node_leaving_dead_resets_throttle(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """Once the node reads alive, a node that reads dead again gets a write."""
+    failing_valve_writes(hass, calls)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+
+    assert not await trv.set_valve(50)
+    hass.states.async_set(NODE_STATUS_ID, "alive")
+    assert not await trv.set_valve(50)
+    hass.states.async_set(NODE_STATUS_ID, "dead")
+    assert not await trv.set_valve(50)
+    assert len(calls) == 3  # noqa: PLR2004
+
+
+@pytest.mark.usefixtures("node_status")
+@pytest.mark.parametrize("status", ["alive", "asleep", "unknown"])
+async def test_live_node_writes_are_not_throttled(
+    hass: HomeAssistant, calls: list[ServiceCall], status: str
+) -> None:
+    """Failed writes to a node that is not dead are all sent."""
+    hass.states.async_set(NODE_STATUS_ID, status)
+    failing_valve_writes(hass, calls)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+
+    assert not await trv.set_valve(50)
+    assert not await trv.set_valve(50)
+    assert len(calls) == 2  # noqa: PLR2004
+
+
+async def test_disabled_node_status_does_not_throttle(
+    hass: HomeAssistant, full_spirit: Spirit, calls: list[ServiceCall]
+) -> None:
+    """Without a node status reading, every write is sent."""
     _add_entity(
         full_spirit,
         "sensor",
@@ -598,11 +666,12 @@ async def test_disabled_node_status_falls_back_to_climate(
         NODE_STATUS_ID,
         disabled_by=er.RegistryEntryDisabler.USER,
     )
+    failing_valve_writes(hass, calls)
     trv = SpiritTrv(hass, CLIMATE_ID)
 
-    assert trv.available
-    hass.states.async_set(CLIMATE_ID, STATE_UNAVAILABLE)
-    assert not trv.available
+    assert not await trv.set_valve(50)
+    assert not await trv.set_valve(50)
+    assert len(calls) == 2  # noqa: PLR2004
 
 
 @pytest.mark.usefixtures("full_spirit")
