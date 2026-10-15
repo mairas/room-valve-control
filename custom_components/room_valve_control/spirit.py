@@ -211,6 +211,16 @@ class SpiritTrv:
         self._offset = (offset.domain, offset.unique_id, offset.entity_id)
 
     @property
+    def name(self) -> str:
+        """Return the climate entity's current id."""
+        return self.climate_entity_id
+
+    @property
+    def max_offset(self) -> float:
+        """Return parameter 8's limit in °C."""
+        return OFFSET_LIMIT_TENTHS / OFFSET_TENTHS_PER_DEGREE
+
+    @property
     def climate_entity_id(self) -> str:
         """Return the climate entity's current id."""
         return self._entity_id(*self._climate)
