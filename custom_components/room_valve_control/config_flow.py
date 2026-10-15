@@ -67,8 +67,8 @@ DEFAULT_ROOM: Final[dict[str, Any]] = {
     CONF_MAX_TARGET: DEFAULT_MAX_TARGET,
 }
 
-# Shown in the minimum change error; the TRV-specific placeholders are only
-# filled in when that error is.
+# Used by the minimum change field's description and its error, so every form
+# render needs them.
 LIMIT_PLACEHOLDERS: Final = {
     "endpoint_tolerance": f"{ENDPOINT_TOLERANCE:g}",
     "valve_max": f"{VALVE_MAX:g}",
