@@ -76,9 +76,9 @@ class Room:
         self._last_output: int | None = None
         self._last_error: float | None = None
         self._last_direct_step: datetime | None = None
-        # Indices of the TRVs this room switched to direct mode and has not
-        # switched out since; finding one of them elsewhere is an external change.
-        self._directed: set[int] = set()
+        # The TRVs this room switched to direct mode and has not switched out
+        # since; finding one of them elsewhere is an external change.
+        self._directed: set[Trv] = set()
 
     @property
     def control_mode(self) -> ControlMode:
@@ -162,16 +162,16 @@ class Room:
         if self._last_direct_step is not None:
             elapsed = min(now - self._last_direct_step, elapsed)
         self._last_direct_step = now
-        available = [(i, trv) for i, trv in enumerate(self._trvs) if trv.available]
+        available = [trv for trv in self._trvs if trv.available]
         output = round(
             self._controller.step(target, reading, elapsed, integrate=bool(available))
         )
         self._last_output = output
         self._last_error = target - reading
-        for index, trv in available:
+        for trv in available:
             # Entering direct mode moves the valve to its last direct-mode value,
             # which the readback does not show yet.
-            entered = await self._ensure_direct(index, trv)
+            entered = await self._ensure_direct(trv)
             if (
                 entered
                 or trv.valve is None
@@ -182,22 +182,22 @@ class Room:
                 self._device_writes += await trv.set_valve(output)
             await self._update_offset(trv, reading)
 
-    async def _ensure_direct(self, index: int, trv: Trv) -> bool:
+    async def _ensure_direct(self, trv: Trv) -> bool:
         """Put the TRV in direct mode; return whether it was switched just now."""
         if trv.mode is TrvMode.DIRECT:
             return False
-        if index in self._directed:
+        if trv in self._directed:
             _LOGGER.warning(
-                "%s: TRV %d left direct mode (now %s) without the room switching it",
+                "%s: %s left direct mode (now %s) without the room switching it",
                 self._name,
-                index + 1,
+                trv.name,
                 trv.mode,
             )
         if await trv.enter_direct():
             self._device_writes += 1
-            self._directed.add(index)
+            self._directed.add(trv)
             return True
-        self._directed.discard(index)
+        self._directed.discard(trv)
         return False
 
     async def _update_offset(self, trv: Trv, reading: float) -> None:
@@ -213,7 +213,7 @@ class Room:
             self._device_writes += await trv.set_offset(wanted)
 
     async def _self_regulate(self, setpoint: float) -> None:
-        for index, trv in enumerate(self._trvs):
+        for trv in self._trvs:
             if trv.available:
                 self._device_writes += await trv.enter_self_regulation(setpoint)
-                self._directed.discard(index)
+                self._directed.discard(trv)
