@@ -2,16 +2,13 @@
 
 import asyncio
 import logging
-from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Final
 
 import pytest
 from homeassistant.const import EVENT_STATE_CHANGED, STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
-from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.room_valve_control import spirit
 from custom_components.room_valve_control.spirit import (
@@ -22,21 +19,37 @@ from custom_components.room_valve_control.spirit import (
 )
 from custom_components.room_valve_control.trv import TrvMode
 
+from .helpers import (
+    COMMAND_CLASS_CONFIGURATION,
+    COMMAND_CLASS_SWITCH_MULTILEVEL,
+    COMMAND_CLASS_THERMOSTAT_MODE,
+    HOME_ID,
+    ZWAVE_JS,
+    Spirit,
+    add_entity,
+    add_offset_entity,
+    add_spirit_device,
+    add_valve_entity,
+    value_unique_id,
+)
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from freezegun.api import FrozenDateTimeFactory
     from homeassistant.core import HomeAssistant, ServiceCall
 
-ZWAVE_JS: Final = "zwave_js"
-HOME_ID: Final = 3245146787
 NODE_ID: Final = 7
 CLIMATE_ID: Final = "climate.living_room_trv"
 VALVE_ID: Final = "number.living_room_trv_valve_control"
 OFFSET_ID: Final = "number.living_room_trv_temperature_offset"
-CLIMATE_UNIQUE_ID: Final = f"{HOME_ID}.{NODE_ID}-64-0-mode"
-VALVE_UNIQUE_ID: Final = f"{HOME_ID}.{NODE_ID}-38-0-currentValue"
-OFFSET_UNIQUE_ID: Final = f"{HOME_ID}.{NODE_ID}-112-0-8"
+CLIMATE_UNIQUE_ID: Final = value_unique_id(
+    NODE_ID, COMMAND_CLASS_THERMOSTAT_MODE, "mode"
+)
+VALVE_UNIQUE_ID: Final = value_unique_id(
+    NODE_ID, COMMAND_CLASS_SWITCH_MULTILEVEL, "currentValue"
+)
+OFFSET_UNIQUE_ID: Final = value_unique_id(NODE_ID, COMMAND_CLASS_CONFIGURATION, "8")
 NODE_STATUS_ID: Final = "sensor.living_room_trv_node_status"
 NODE_STATUS_UNIQUE_ID: Final = f"{HOME_ID}.{NODE_ID}.node_status"
 CURRENT_TEMPERATURE: Final = 20.5
@@ -49,53 +62,17 @@ ADAPTER_SERVICES: Final = (
 )
 
 
-@dataclass
-class Spirit:
-    """Registry entries of one mocked Spirit TRV."""
-
-    device_id: str
-    entity_registry: er.EntityRegistry
-
-
-def _add_entity(
-    spirit: Spirit,
-    domain: str,
-    unique_id: str,
-    entity_id: str,
-    disabled_by: er.RegistryEntryDisabler | None = None,
-) -> None:
-    entry = spirit.entity_registry.async_get_or_create(
-        domain,
-        ZWAVE_JS,
-        unique_id,
-        device_id=spirit.device_id,
-        suggested_object_id=entity_id.split(".", 1)[1],
-        disabled_by=disabled_by,
-    )
-    assert entry.entity_id == entity_id
-
-
 @pytest.fixture
 def spirit_device(hass: HomeAssistant) -> Spirit:
     """Register a Spirit device with only its climate entity."""
-    config_entry = MockConfigEntry(domain=ZWAVE_JS)
-    config_entry.add_to_hass(hass)
-    device = dr.async_get(hass).async_get_or_create(
-        config_entry_id=config_entry.entry_id,
-        identifiers={(ZWAVE_JS, f"{HOME_ID}-{NODE_ID}")},
-        manufacturer="Eurotronic",
-        model="Spirit Z-Wave Plus",
-    )
-    spirit = Spirit(device.id, er.async_get(hass))
-    _add_entity(spirit, "climate", CLIMATE_UNIQUE_ID, CLIMATE_ID)
-    return spirit
+    return add_spirit_device(hass, NODE_ID, CLIMATE_ID)
 
 
 @pytest.fixture
 def full_spirit(hass: HomeAssistant, spirit_device: Spirit) -> Spirit:
     """Register a Spirit with its valve and offset entities and states."""
-    _add_entity(spirit_device, "number", VALVE_UNIQUE_ID, VALVE_ID)
-    _add_entity(spirit_device, "number", OFFSET_UNIQUE_ID, OFFSET_ID)
+    add_valve_entity(spirit_device, VALVE_ID)
+    add_offset_entity(spirit_device, OFFSET_ID)
     set_climate(hass, "heat")
     hass.states.async_set(VALVE_ID, "40.0")
     hass.states.async_set(OFFSET_ID, "-12.0")
@@ -160,10 +137,13 @@ async def test_lookup_ignores_entity_ids(
     hass: HomeAssistant, spirit_device: Spirit
 ) -> None:
     """Renamed entities are still found by their Z-Wave value."""
-    _add_entity(spirit_device, "number", VALVE_UNIQUE_ID, "number.renamed_valve")
-    _add_entity(spirit_device, "number", OFFSET_UNIQUE_ID, "number.renamed_offset")
-    _add_entity(
-        spirit_device, "number", f"{HOME_ID}.{NODE_ID}-112-0-7", "number.param_7"
+    add_entity(spirit_device, "number", VALVE_UNIQUE_ID, "number.renamed_valve")
+    add_entity(spirit_device, "number", OFFSET_UNIQUE_ID, "number.renamed_offset")
+    add_entity(
+        spirit_device,
+        "number",
+        value_unique_id(NODE_ID, COMMAND_CLASS_CONFIGURATION, "7"),
+        "number.param_7",
     )
 
     trv = SpiritTrv(hass, CLIMATE_ID)
@@ -176,8 +156,8 @@ async def test_disabled_offset_entity_fails_naming_it(
     hass: HomeAssistant, spirit_device: Spirit
 ) -> None:
     """A disabled parameter 8 entity is reported with its entity id."""
-    _add_entity(spirit_device, "number", VALVE_UNIQUE_ID, VALVE_ID)
-    _add_entity(
+    add_entity(spirit_device, "number", VALVE_UNIQUE_ID, VALVE_ID)
+    add_entity(
         spirit_device,
         "number",
         OFFSET_UNIQUE_ID,
@@ -198,7 +178,7 @@ async def test_missing_valve_entity_fails(
     hass: HomeAssistant, spirit_device: Spirit
 ) -> None:
     """A device without the valve number cannot be controlled."""
-    _add_entity(spirit_device, "number", OFFSET_UNIQUE_ID, OFFSET_ID)
+    add_entity(spirit_device, "number", OFFSET_UNIQUE_ID, OFFSET_ID)
 
     with pytest.raises(SpiritEntityError) as excinfo:
         SpiritTrv(hass, CLIMATE_ID)
@@ -663,7 +643,7 @@ def failing_valve_writes(hass: HomeAssistant, calls: list[ServiceCall]) -> None:
 @pytest.fixture
 def node_status(hass: HomeAssistant, full_spirit: Spirit) -> None:
     """Register the Spirit's node status sensor, reading dead."""
-    _add_entity(full_spirit, "sensor", NODE_STATUS_UNIQUE_ID, NODE_STATUS_ID)
+    add_entity(full_spirit, "sensor", NODE_STATUS_UNIQUE_ID, NODE_STATUS_ID)
     hass.states.async_set(NODE_STATUS_ID, "dead")
 
 
@@ -740,7 +720,7 @@ async def test_disabled_node_status_does_not_throttle(
     hass: HomeAssistant, full_spirit: Spirit, calls: list[ServiceCall]
 ) -> None:
     """Without a node status reading, every write is sent."""
-    _add_entity(
+    add_entity(
         full_spirit,
         "sensor",
         NODE_STATUS_UNIQUE_ID,
