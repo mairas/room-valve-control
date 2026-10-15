@@ -1,0 +1,92 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "description": "Add Room Valve Control. Rooms are added to it afterwards."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Room Valve Control is already set up."
+    }
+  },
+  "config_subentries": {
+    "room": {
+      "entry_type": "Room",
+      "initiate_flow": {
+        "user": "Add room"
+      },
+      "step": {
+        "user": {
+          "title": "Add room",
+          "data": {
+            "name": "Name",
+            "sensors": "Wall temperature sensors",
+            "trvs": "TRVs",
+            "kp": "Proportional gain (Kp)",
+            "ti": "Integral time (Ti)",
+            "control_step": "Control step",
+            "min_change": "Minimum valve change",
+            "stale_timeout": "Stale sensor timeout",
+            "min_target": "Minimum target temperature",
+            "max_target": "Maximum target temperature"
+          },
+          "data_description": {
+            "name": "Name of the room and of its thermostat entity.",
+            "sensors": "The room temperature is the mean of the sensors that have reported within the stale sensor timeout.",
+            "trvs": "Eurotronic Spirit TRVs. Each TRV's valve control and temperature offset (parameter 8) entities must be enabled. A TRV can belong to one room only.",
+            "kp": "Valve change in % points per °C of control error.",
+            "ti": "Time in which the integral term adds as much as the proportional term at a constant error.",
+            "control_step": "How often the valve position is computed.",
+            "min_change": "A TRV is written only when the computed position differs from its valve reading by at least this many % points. Above {endpoint_tolerance} and at most {valve_max}.",
+            "stale_timeout": "When no wall sensor has reported for this long, the TRVs regulate on their own.",
+            "min_target": "Lowest target temperature the room thermostat accepts.",
+            "max_target": "Highest target temperature the room thermostat accepts."
+          }
+        },
+        "reconfigure": {
+          "title": "Reconfigure room",
+          "data": {
+            "name": "Name",
+            "sensors": "Wall temperature sensors",
+            "trvs": "TRVs",
+            "kp": "Proportional gain (Kp)",
+            "ti": "Integral time (Ti)",
+            "control_step": "Control step",
+            "min_change": "Minimum valve change",
+            "stale_timeout": "Stale sensor timeout",
+            "min_target": "Minimum target temperature",
+            "max_target": "Maximum target temperature"
+          },
+          "data_description": {
+            "name": "Name of the room and of its thermostat entity.",
+            "sensors": "The room temperature is the mean of the sensors that have reported within the stale sensor timeout.",
+            "trvs": "Eurotronic Spirit TRVs. Each TRV's valve control and temperature offset (parameter 8) entities must be enabled. A TRV can belong to one room only.",
+            "kp": "Valve change in % points per °C of control error.",
+            "ti": "Time in which the integral term adds as much as the proportional term at a constant error.",
+            "control_step": "How often the valve position is computed.",
+            "min_change": "A TRV is written only when the computed position differs from its valve reading by at least this many % points. Above {endpoint_tolerance} and at most {valve_max}.",
+            "stale_timeout": "When no wall sensor has reported for this long, the TRVs regulate on their own.",
+            "min_target": "Lowest target temperature the room thermostat accepts.",
+            "max_target": "Highest target temperature the room thermostat accepts."
+          }
+        }
+      },
+      "error": {
+        "no_sensor": "Select at least one wall temperature sensor.",
+        "sensor_not_registered": "{sensor} has no unique ID, so the room could not find it again after a rename. Give it a unique ID or select another sensor.",
+        "no_trv": "Select at least one TRV.",
+        "trv_in_use": "{trv} already belongs to the room {room}.",
+        "trv_entity_missing": "{trv} is not usable: its {entity} entity was not found. Only Eurotronic Spirit TRVs on Z-Wave JS are supported.",
+        "trv_entity_disabled": "{trv} is not usable: its {entity} entity {entity_id} is disabled. Enable it and try again.",
+        "trv_no_device": "{trv} is not usable: it belongs to no device. Only Eurotronic Spirit TRVs on Z-Wave JS are supported.",
+        "not_positive": "Must be greater than zero.",
+        "not_finite": "Must be a finite number.",
+        "min_change_out_of_range": "Must be above {endpoint_tolerance} and at most {valve_max} % points.",
+        "target_range_empty": "Must be greater than the minimum target temperature."
+      },
+      "abort": {
+        "reconfigure_successful": "The room was reconfigured."
+      }
+    }
+  }
+}
