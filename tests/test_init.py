@@ -2,17 +2,23 @@
 
 import asyncio
 import logging
+from datetime import timedelta
 from typing import TYPE_CHECKING, Final
 
 import pytest
-from homeassistant.config_entries import ConfigEntryState
-from homeassistant.const import EVENT_HOMEASSISTANT_STOP, STATE_UNKNOWN
+from homeassistant.config_entries import RELOAD_AFTER_UPDATE_DELAY, ConfigEntryState
+from homeassistant.const import (
+    ATTR_TEMPERATURE,
+    EVENT_HOMEASSISTANT_STOP,
+    STATE_UNKNOWN,
+)
 from homeassistant.core import callback
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.room_valve_control import runtime
 from custom_components.room_valve_control.const import (
+    CONF_KP,
     DEFAULT_CONTROL_STEP,
     DEFAULT_STALE_TIMEOUT,
     DOMAIN,
@@ -21,6 +27,7 @@ from custom_components.room_valve_control.spirit import DIRECT_MODE_PRESET
 
 from .live_room import (
     ROOM_CLIMATE,
+    ROOM_ID,
     ROOM_TITLE,
     TRVS,
     WALL_SENSOR,
@@ -42,9 +49,11 @@ TARGET: Final = 21.0
 READING: Final = "20.0"
 OUTPUT: Final = 30
 OFFSET_TENTHS: Final = -5
+RELOAD_DELAY: Final = timedelta(seconds=RELOAD_AFTER_UPDATE_DELAY + 1)
 # Off the TRVs' own setpoint, so a fallback step writes it.
 FALLBACK_TARGET: Final = 20.5
 OTHER_SENSOR: Final = "sensor.living_room_window_temperature"
+RENAMED_CLIMATE: Final = "climate.lounge"
 STEPS_IN_STARTUP_GRACE: Final = DEFAULT_STALE_TIMEOUT // DEFAULT_CONTROL_STEP - 1
 
 
@@ -296,3 +305,74 @@ async def test_room_without_wall_sensors_falls_back(
 
     assert "no wall sensor left" in caplog.text
     assert calls == [("set_temperature", ids.climate, FALLBACK_TARGET) for ids in TRVS]
+
+
+@pytest.mark.parametrize("change", ["disable", "remove"])
+async def test_climate_entity_going_away_hands_back(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    calls: list[TrvCall],
+    change: str,
+) -> None:
+    """Disabling or removing the room thermostat hands its TRVs back for good."""
+    hass.states.async_set(WALL_SENSOR, READING)
+    await async_setup_room(hass)
+    await async_set_room_target(hass, TARGET)
+    calls.clear()
+    registry = er.async_get(hass)
+
+    if change == "disable":
+        registry.async_update_entity(
+            ROOM_CLIMATE, disabled_by=er.RegistryEntryDisabler.USER
+        )
+    else:
+        registry.async_remove(ROOM_CLIMATE)
+    await hass.async_block_till_done()
+    assert hass.states.get(ROOM_CLIMATE) is None
+    assert calls == handing_back()
+
+    # Disabling reloads the entry after a delay; the room stays handed back.
+    await async_advance(hass, freezer, RELOAD_DELAY)
+    await async_advance(hass, freezer)
+    assert calls == handing_back()
+
+
+async def test_reload_hands_back_once(
+    hass: HomeAssistant, calls: list[TrvCall]
+) -> None:
+    """A room change reloads the entry, which hands each TRV back once."""
+    hass.states.async_set(WALL_SENSOR, READING)
+    entry = await async_setup_room(hass)
+    await async_set_room_target(hass, TARGET)
+    calls.clear()
+    subentry = entry.subentries[ROOM_ID]
+
+    hass.config_entries.async_update_subentry(
+        entry, subentry, data={**subentry.data, CONF_KP: 40.0}
+    )
+    await hass.async_block_till_done()
+
+    handed_back = handing_back()
+    assert calls[: len(handed_back)] == handed_back
+    assert ("set_hvac_mode", TRVS[0].climate, "heat") not in calls[len(handed_back) :]
+
+
+async def test_renamed_climate_entity_keeps_the_room_running(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, calls: list[TrvCall]
+) -> None:
+    """A new entity id re-adds the thermostat without handing the TRVs back."""
+    hass.states.async_set(WALL_SENSOR, READING)
+    await async_setup_room(hass)
+    await async_set_room_target(hass, TARGET)
+    calls.clear()
+
+    er.async_get(hass).async_update_entity(ROOM_CLIMATE, new_entity_id=RENAMED_CLIMATE)
+    await hass.async_block_till_done()
+    renamed = hass.states.get(RENAMED_CLIMATE)
+    hass.states.async_set(WALL_SENSOR, "19.5")
+    await async_advance(hass, freezer)
+
+    assert renamed is not None
+    assert renamed.attributes[ATTR_TEMPERATURE] == TARGET
+    # One step on the single, still running room: see the direct-mode test.
+    assert calls == [("set_value", ids.valve, 60) for ids in TRVS]
