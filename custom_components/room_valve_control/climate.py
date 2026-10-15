@@ -9,6 +9,8 @@ from homeassistant.components.climate.const import ClimateEntityFeature, HVACMod
 from homeassistant.const import ATTR_TEMPERATURE, PRECISION_TENTHS, UnitOfTemperature
 from homeassistant.helpers.restore_state import ExtraStoredData, RestoreEntity
 
+from .runtime import async_hand_back_all
+
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
@@ -119,14 +121,30 @@ class RoomClimate(ClimateEntity, RestoreEntity):
     @override
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
+        self.async_on_remove(self._runtime.add_listener(self.async_write_ha_state))
+        if self._runtime.room is not None:
+            # Re-added under a new entity id: the room never stopped.
+            return
         extra = await self.async_get_last_extra_data()
         stored = RoomStoredData.from_dict(extra.as_dict() if extra else {})
-        self.async_on_remove(self._runtime.add_listener(self.async_write_ha_state))
         await self._runtime.async_start(
             target=stored.target,
             controller_state=stored.controller,
             device_writes=stored.device_writes,
         )
+
+    @override
+    async def async_will_remove_from_hass(self) -> None:
+        """Hand the room back unless the entity is only getting a new entity id."""
+        entry = self.registry_entry
+        renamed = (
+            entry is not None
+            and not entry.disabled
+            and entry.entity_id != self.entity_id
+        )
+        if not renamed:
+            await async_hand_back_all((self._runtime,))
+        await super().async_will_remove_from_hass()
 
     @override
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
