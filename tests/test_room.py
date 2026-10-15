@@ -31,6 +31,7 @@ SETTINGS: Final = RoomSettings(
     min_valve_change=MIN_CHANGE,
     stale_timeout=STALE_TIMEOUT,
 )
+SPIRIT_MAX_OFFSET: Final = 5.0
 START: Final = datetime(2026, 10, 16, 6, 0, tzinfo=UTC)
 TARGET: Final = 21.0
 
@@ -43,6 +44,8 @@ class FakeTrv:
     def __init__(  # noqa: PLR0913
         self,
         *,
+        name: str = "climate.trv",
+        max_offset: float = SPIRIT_MAX_OFFSET,
         available: bool = True,
         mode: TrvMode = TrvMode.SELF_REGULATING,
         setpoint: float | None = None,
@@ -52,6 +55,8 @@ class FakeTrv:
         sends: bool = True,
     ) -> None:
         """Create a TRV in the given state."""
+        self.name = name
+        self.max_offset = max_offset
         self.available = available
         self.mode = mode
         self.setpoint = setpoint
@@ -92,10 +97,10 @@ class FakeTrv:
         return self.sends
 
     async def set_offset(self, offset: float) -> bool:
-        """Record the offset write."""
+        """Record the offset write; apply it clamped like the Spirit."""
         self.calls.append(("offset", offset))
         if self.sends:
-            self.offset = offset
+            self.offset = max(-self.max_offset, min(self.max_offset, offset))
         return self.sends
 
 
