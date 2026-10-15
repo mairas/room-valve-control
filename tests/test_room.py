@@ -1,6 +1,7 @@
 """Tests for the per-room control state machine."""
 
 import asyncio
+import contextlib
 import logging
 import math
 from datetime import UTC, datetime, timedelta
@@ -607,6 +608,33 @@ async def test_hand_back_waits_for_a_suspended_step() -> None:
     assert trv.calls == [("direct",), ("valve", 30), ("heat",), ("setpoint", TARGET)]
     assert trv.mode is TrvMode.SELF_REGULATING
     assert room.control_mode is ControlMode.STOPPED
+
+
+async def test_hand_back_forces_heat_on_a_cancelled_enter_direct() -> None:
+    """
+    A TRV whose direct-mode write was cut off by a cancel gets heat mode anyway.
+
+    The write may still reach the node, so its heat readback proves nothing.
+    """
+    directed = FakeTrv(valve=0.0)
+    entering = FakeTrv(valve=0.0, setpoint=TARGET)
+    untouched = FakeTrv(valve=0.0, setpoint=TARGET)
+    room = make_room([directed, entering, untouched])
+    await room.set_target(TARGET)
+    close_gates(entering)
+    step = asyncio.create_task(room.step(START, fresh(20.0, START)))
+    await entering.suspended.wait()
+    step.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await step
+    entering.gate = None
+    clear(directed, entering, untouched)
+
+    await room.hand_back()
+
+    assert directed.calls == [("heat",), ("setpoint", TARGET)]
+    assert entering.calls == [("heat",), ("setpoint", TARGET)]
+    assert untouched.calls == []
 
 
 async def test_stopped_room_writes_nothing() -> None:
