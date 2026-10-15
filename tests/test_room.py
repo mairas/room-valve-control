@@ -1,5 +1,6 @@
 """Tests for the per-room control state machine."""
 
+import asyncio
 import logging
 import math
 from datetime import UTC, datetime, timedelta
@@ -52,6 +53,7 @@ class FakeTrv:
         own_temperature: float | None = None,
         offset: float | None = None,
         sends: bool = True,
+        deferred_readbacks: int = 0,
     ) -> None:
         """Create a TRV in the given state."""
         self.name = name
@@ -63,11 +65,23 @@ class FakeTrv:
         self.own_temperature = own_temperature
         self.offset = offset
         self.sends = sends
+        # Mode changes to self-regulation that do not read back in time, so the
+        # call returns the mode write and leaves the setpoint to the next call.
+        self.deferred_readbacks = deferred_readbacks
+        # While set, every write waits for the gate after recording its call.
+        self.gate: asyncio.Event | None = None
+        self.suspended = asyncio.Event()
         self.calls: list[Call] = []
+
+    async def _wait_for_gate(self) -> None:
+        if self.gate is not None:
+            self.suspended.set()
+            await self.gate.wait()
 
     async def enter_direct(self) -> bool:
         """Record the mode write."""
         self.calls.append(("direct",))
+        await self._wait_for_gate()
         if self.sends:
             self.mode = TrvMode.DIRECT
         return self.sends
@@ -77,12 +91,17 @@ class FakeTrv:
         sent = 0
         if self.mode is not TrvMode.SELF_REGULATING:
             self.calls.append(("heat",))
+            await self._wait_for_gate()
             if not self.sends:
                 return sent
+            if self.deferred_readbacks:
+                self.deferred_readbacks -= 1
+                return 1
             self.mode = TrvMode.SELF_REGULATING
             sent += 1
         if self.setpoint != setpoint:
             self.calls.append(("setpoint", setpoint))
+            await self._wait_for_gate()
             if self.sends:
                 self.setpoint = setpoint
                 sent += 1
@@ -91,6 +110,7 @@ class FakeTrv:
     async def set_valve(self, percent: int) -> bool:
         """Record the valve write."""
         self.calls.append(("valve", percent))
+        await self._wait_for_gate()
         if self.sends:
             self.valve = percent
         return self.sends
@@ -98,6 +118,7 @@ class FakeTrv:
     async def set_offset(self, offset: float) -> bool:
         """Record the offset write; apply it clamped like the Spirit."""
         self.calls.append(("offset", offset))
+        await self._wait_for_gate()
         if self.sends:
             self.offset = max(-self.max_offset, min(self.max_offset, offset))
         return self.sends
@@ -130,6 +151,21 @@ def at(minutes: float) -> datetime:
 def warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
     """Return the captured records at warning level or above."""
     return [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def close_gates(*trvs: FakeTrv) -> asyncio.Event:
+    """Make every write of the TRVs wait for the returned event."""
+    gate = asyncio.Event()
+    for trv in trvs:
+        trv.gate = gate
+        trv.suspended.clear()
+    return gate
+
+
+async def settle() -> None:
+    """Let every runnable task run until it blocks."""
+    for _ in range(10):
+        await asyncio.sleep(0)
 
 
 def clear(*trvs: FakeTrv) -> None:
@@ -395,6 +431,32 @@ async def test_trv_reentered_after_fallback_is_not_logged(
     assert warnings(caplog) == []
 
 
+@pytest.mark.parametrize("directed", [True, False])
+async def test_trv_back_from_unavailable_in_self_regulation(
+    caplog: pytest.LogCaptureFixture, *, directed: bool
+) -> None:
+    """
+    A TRV missed by the fallback and found self-regulating warns if directed.
+
+    The room never switched it out of direct mode, so finding it switched is a
+    change the room did not make; a TRV it never directed is simply entered.
+    """
+    trv = FakeTrv(valve=0.0, available=directed)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    trv.available = False
+    await go_fallback(room, trv, now=at(90))
+    assert trv.calls == []
+    trv.available = True
+    trv.mode = TrvMode.SELF_REGULATING
+
+    with caplog.at_level(logging.WARNING):
+        await room.step(at(105), fresh(20.0, at(105)))
+
+    assert trv.calls[0] == ("direct",)
+    assert len(warnings(caplog)) == (1 if directed else 0)
+
+
 async def test_stale_sensor_is_ignored_when_another_is_fresh() -> None:
     """Of two sensors, only the one reported within the timeout counts."""
     room = make_room([FakeTrv(valve=0.0)])
@@ -505,6 +567,82 @@ async def test_hand_back_without_target_touches_nothing() -> None:
     await room.hand_back()
 
     assert trv.calls == []
+
+
+async def test_hand_back_from_waiting_hands_back() -> None:
+    """A room still waiting for readings hands back TRVs left in direct mode."""
+    trv = FakeTrv(mode=TrvMode.DIRECT, setpoint=19.0)
+    room = make_room([trv])
+    await room.set_target(TARGET)
+    await room.step(START, [])
+    assert room.control_mode is ControlMode.WAITING
+
+    await room.hand_back()
+
+    assert trv.calls == [("heat",), ("setpoint", TARGET)]
+    assert room.control_mode is ControlMode.STOPPED
+
+
+async def test_hand_back_waits_for_a_suspended_step() -> None:
+    """A step suspended in a TRV write finishes before the hand back starts."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await room.set_target(TARGET)
+    gate = close_gates(trv)
+    step = asyncio.create_task(room.step(START, fresh(20.0, START)))
+    await trv.suspended.wait()
+
+    hand_back = asyncio.create_task(room.hand_back())
+    await settle()
+    assert trv.calls == [("direct",)]
+    gate.set()
+    await step
+    await hand_back
+
+    assert trv.calls == [("direct",), ("valve", 30), ("heat",), ("setpoint", TARGET)]
+    assert trv.mode is TrvMode.SELF_REGULATING
+    assert room.control_mode is ControlMode.STOPPED
+
+
+async def test_stopped_room_writes_nothing() -> None:
+    """After hand back neither steps nor targets reach the TRVs."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    await room.hand_back()
+    clear(trv)
+    writes = room.device_writes
+
+    await room.step(at(15), fresh(20.0, at(15)))
+    await room.step(at(120), [])
+    await room.set_target(22.5)
+    await room.hand_back()
+
+    assert trv.calls == []
+    assert room.device_writes == writes
+    assert room.control_mode is ControlMode.STOPPED
+    assert room.target == TARGET
+    assert room.last_output is None
+    assert not room.needs_immediate_step(at(120), fresh(20.0, at(120)))
+
+
+async def test_target_set_during_fallback_step_is_written_after_it() -> None:
+    """A new target waits for the step's mode and setpoint writes to finish."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    gate = close_gates(trv)
+    step = asyncio.create_task(room.step(at(90), []))
+    await trv.suspended.wait()
+
+    set_target = asyncio.create_task(room.set_target(22.5))
+    await settle()
+    assert trv.calls == [("heat",)]
+    gate.set()
+    await step
+    await set_target
+
+    assert trv.calls == [("heat",), ("setpoint", TARGET), ("setpoint", 22.5)]
 
 
 @pytest.mark.parametrize(
