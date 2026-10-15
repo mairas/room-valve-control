@@ -140,14 +140,12 @@ class Room:
         """
         Set the target at once; in fallback, also write it to the TRVs.
 
-        Ignored once stopped, so the target stays what the TRVs were handed.
+        A stopped room only records it, for the next room to start from.
         Only the fallback write waits for an operation in progress, and it
         writes the target current when it runs. Every switch into fallback
         happens under the lock before the step's own write, so outside
         fallback no write is needed.
         """
-        if self._mode is ControlMode.STOPPED:
-            return
         self._target = target
         if self._mode is not ControlMode.FALLBACK:
             return
