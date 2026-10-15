@@ -20,7 +20,7 @@ CONF_STALE_TIMEOUT: Final = "stale_timeout"
 CONF_MIN_TARGET: Final = "min_target"
 CONF_MAX_TARGET: Final = "max_target"
 
-# The old 12 min integral time over-integrates at a 15 min step (81 simulated
+# A 12 min integral time over-integrates at a 15 min step (81 simulated
 # writes/day); 30 min tracks best within the write budget. The stale timeout sits
 # above the wall sensors' longest report gap seen in ten days (26 min).
 DEFAULT_KP: Final = 30.0
