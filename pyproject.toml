@@ -1,0 +1,66 @@
+[project]
+name = "room-valve-control"
+version = "0.1.0"
+description = "Home Assistant custom component: per-room PI control of radiator valves from a wall temperature sensor"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.14.2"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "mypy==2.4.0",
+    "pytest-homeassistant-custom-component==0.13.367",
+    "ruff==0.16.10",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+explicit_package_bases = true
+files = ["custom_components", "tests"]
+
+[[tool.mypy.overrides]]
+module = "pytest_homeassistant_custom_component.*"
+follow_untyped_imports = true
+
+# mypy keeps an attribute narrowed across an await, so re-checking state that
+# the awaited call changed (entry.state after an unload) reads as unreachable.
+[[tool.mypy.overrides]]
+module = "tests.*"
+disable_error_code = ["comparison-overlap"]
+
+# Based on https://github.com/ludeeus/integration_blueprint/blob/main/.ruff.toml,
+# itself based on Home Assistant Core's pyproject.toml.
+[tool.ruff]
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "ANN401", # Dynamically typed expressions (typing.Any) are disallowed
+    "D203",   # no-blank-line-before-class (incompatible with formatter)
+    "D212",   # multi-line-summary-first-line (incompatible with formatter)
+    "COM812", # incompatible with formatter
+    "CPY001", # copyright is stated once, in LICENSE
+    "ISC001", # incompatible with formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.ruff.lint.flake8-pytest-style]
+fixture-parentheses = false
+
+[tool.ruff.lint.pyupgrade]
+keep-runtime-typing = true
+
+[tool.ruff.lint.mccabe]
+max-complexity = 25
