@@ -108,12 +108,11 @@ class RoomClimate(ClimateEntity, RestoreEntity):
     @override
     def extra_restore_state_data(self) -> RoomStoredData | None:
         room = self._runtime.room
-        controller = self._runtime.controller
-        if room is None or controller is None:
+        if room is None:
             return None
         return RoomStoredData(
             target=room.target,
-            controller=controller.as_dict(),
+            controller=room.controller_state,
             device_writes=room.device_writes,
         )
 

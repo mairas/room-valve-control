@@ -91,7 +91,6 @@ class RoomRuntime:
         self._trvs = trvs
         self.room: Room | None = None
         self._started_at: datetime | None = None
-        self.controller: PIController | None = None
         # Keeps an immediate step's condition and the step together; Room
         # itself serializes its writes.
         self._step_lock = asyncio.Lock()
@@ -181,7 +180,6 @@ class RoomRuntime:
             # A waiting room only stores the target.
             await room.set_target(target)
         self.room = room
-        self.controller = controller
         self._unsubscribes = [
             async_track_time_interval(
                 self._hass,
