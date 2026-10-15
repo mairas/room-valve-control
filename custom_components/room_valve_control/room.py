@@ -154,7 +154,8 @@ class Room:
         Stop the room and put every available TRV into self-regulation.
 
         Waits for a step or target change in progress. The TRVs get the target,
-        if there is one.
+        if there is one; a TRV whose mode change has not read back yet is called
+        once more, since the setpoint is only written after it does.
         """
         async with self._lock:
             if self._mode is ControlMode.STOPPED:
@@ -163,7 +164,7 @@ class Room:
             self._last_output = None
             self._last_error = None
             if self._target is not None:
-                await self._self_regulate(self._target)
+                await self._self_regulate(self._target, retry_deferred=True)
 
     async def step(self, now: datetime, readings: Sequence[Reading]) -> None:
         """Run one control step; a stopped room does nothing."""
@@ -242,8 +243,24 @@ class Room:
         ):
             self._device_writes += await trv.set_offset(wanted)
 
-    async def _self_regulate(self, setpoint: float) -> None:
-        for trv in self._trvs:
-            if trv.available:
-                self._device_writes += await trv.enter_self_regulation(setpoint)
-                self._directed.discard(trv)
+    async def _self_regulate(
+        self, setpoint: float, *, retry_deferred: bool = False
+    ) -> None:
+        available = [trv for trv in self._trvs if trv.available]
+        sent = await asyncio.gather(
+            *(
+                _enter_self_regulation(trv, setpoint, retry_deferred=retry_deferred)
+                for trv in available
+            )
+        )
+        self._device_writes += sum(sent)
+        self._directed.difference_update(available)
+
+
+async def _enter_self_regulation(
+    trv: Trv, setpoint: float, *, retry_deferred: bool
+) -> int:
+    sent = await trv.enter_self_regulation(setpoint)
+    if retry_deferred and sent and trv.mode is not TrvMode.SELF_REGULATING:
+        sent += await trv.enter_self_regulation(setpoint)
+    return sent
