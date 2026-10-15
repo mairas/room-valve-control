@@ -26,7 +26,6 @@ CONTROL_STEP: Final = timedelta(minutes=15)
 STALE_TIMEOUT: Final = timedelta(hours=1)
 MIN_CHANGE: Final = 5.0
 SETTINGS: Final = RoomSettings(
-    gains=GAINS,
     control_step=CONTROL_STEP,
     min_valve_change=MIN_CHANGE,
     stale_timeout=STALE_TIMEOUT,

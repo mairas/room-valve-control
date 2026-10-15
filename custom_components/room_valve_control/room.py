@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
-from .controller import PIController, PIGains, should_write_valve
+from .controller import PIController, should_write_valve
 from .trv import Trv, TrvMode
 
 if TYPE_CHECKING:
@@ -38,7 +38,6 @@ class ControlMode(StrEnum):
 class RoomSettings:
     """A room's control parameters."""
 
-    gains: PIGains
     control_step: timedelta
     min_valve_change: float
     stale_timeout: timedelta
