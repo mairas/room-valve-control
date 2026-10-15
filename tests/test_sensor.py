@@ -14,11 +14,13 @@ from homeassistant.helpers import entity_registry as er
 from .live_room import (
     WALL_SENSOR,
     TrvCall,
+    async_advance,
     async_set_room_target,
     async_setup_room,
 )
 
 if TYPE_CHECKING:
+    from freezegun.api import FrozenDateTimeFactory
     from homeassistant.core import HomeAssistant
 
 OUTPUT: Final = "sensor.living_room_valve_output"
@@ -82,14 +84,17 @@ async def test_sensors_before_any_step(
     assert int(state_of(hass, WRITES)) == 0
 
 
-async def test_sensors_show_the_step(hass: HomeAssistant, calls: list[TrvCall]) -> None:
-    """After a direct step the sensors show what it computed and wrote."""
+async def test_sensors_show_the_step(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, calls: list[TrvCall]
+) -> None:
+    """After direct steps the sensors show what they computed and wrote."""
     hass.states.async_set(WALL_SENSOR, "20.0")
     await async_setup_room(hass)
-
     await async_set_room_target(hass, 21.0)
 
-    # Kp 30 x 1 °C; one 15 min step at Ti 30 min integrates half of it.
+    await async_advance(hass, freezer)
+
+    # Kp 30 x 1 °C; one 15 min interval at Ti 30 min integrates half of it.
     assert int(state_of(hass, OUTPUT)) == 30  # noqa: PLR2004
     assert float(state_of(hass, INTEGRATOR)) == 15  # noqa: PLR2004
     assert float(state_of(hass, ERROR)) == 1

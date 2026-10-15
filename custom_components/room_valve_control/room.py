@@ -4,6 +4,7 @@ import asyncio
 import logging
 import math
 from dataclasses import dataclass
+from datetime import timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
@@ -12,7 +13,7 @@ from .trv import Trv, TrvMode
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from datetime import datetime, timedelta
+    from datetime import datetime
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -193,9 +194,10 @@ class Room:
 
     async def _step_direct(self, now: datetime, target: float, reading: float) -> None:
         self._mode = ControlMode.DIRECT
-        elapsed = self._settings.control_step
+        # A new room's first direct step has no interval behind it to integrate.
+        elapsed = timedelta(0)
         if self._last_direct_step is not None:
-            elapsed = min(now - self._last_direct_step, elapsed)
+            elapsed = min(now - self._last_direct_step, self._settings.control_step)
         self._last_direct_step = now
         available = [trv for trv in self._trvs if trv.available]
         output = round(

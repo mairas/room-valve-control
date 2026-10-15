@@ -32,11 +32,13 @@ from .live_room import (
     TRVS,
     WALL_SENSOR,
     TrvCall,
+    async_advance,
     async_set_room_target,
     async_setup_room,
 )
 
 if TYPE_CHECKING:
+    from freezegun.api import FrozenDateTimeFactory
     from homeassistant.core import HomeAssistant
 
 INTEGRATOR_SENSOR: Final = "sensor.living_room_integrator"
@@ -157,18 +159,19 @@ async def test_malformed_stored_state_starts_fresh(
 
 
 async def test_stored_state_round_trips(
-    hass: HomeAssistant, calls: list[TrvCall]
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, calls: list[TrvCall]
 ) -> None:
-    """What the thermostat stores is what a step left behind."""
+    """What the thermostat stores is what the steps left behind."""
     hass.states.async_set(WALL_SENSOR, "20.0")
     await async_setup_room(hass)
     await async_set_room_target(hass, RESTORED_TARGET)
+    await async_advance(hass, freezer)
 
     stored = await async_mock_restore_state_shutdown_restart(hass)
 
     extra = stored.last_states[ROOM_CLIMATE].extra_data
     assert extra is not None
-    # One 15 min step at 0.8 °C error with Ti 30 min: 30 x 0.8 x 15 / 30 %.
+    # One 15 min interval at 0.8 °C error with Ti 30 min: 30 x 0.8 x 15 / 30 %.
     assert extra.as_dict() == {
         "target": RESTORED_TARGET,
         "controller": {"integral": pytest.approx(12.0)},
