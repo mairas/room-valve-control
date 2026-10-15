@@ -62,7 +62,8 @@ class Trv(Protocol):
         Switch to self-regulation at setpoint; return the writes sent.
 
         Writes only the parts (mode, setpoint) that differ from what the TRV
-        reports.
+        reports. After a mode change the setpoint may be left to a later call,
+        so the room calls this again until it returns 0.
         """
         ...
 

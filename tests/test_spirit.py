@@ -10,6 +10,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.room_valve_control import spirit
 from custom_components.room_valve_control.spirit import (
     DIRECT_MODE_PRESET,
     SpiritEntity,
@@ -30,6 +31,7 @@ OFFSET_ID: Final = "number.living_room_trv_temperature_offset"
 CLIMATE_UNIQUE_ID: Final = f"{HOME_ID}.{NODE_ID}-64-0-mode"
 VALVE_UNIQUE_ID: Final = f"{HOME_ID}.{NODE_ID}-38-0-currentValue"
 OFFSET_UNIQUE_ID: Final = f"{HOME_ID}.{NODE_ID}-112-0-8"
+CURRENT_TEMPERATURE: Final = 20.5
 ADAPTER_SERVICES: Final = (
     ("climate", "set_preset_mode"),
     ("climate", "set_hvac_mode"),
@@ -97,8 +99,7 @@ def set_climate(
     state: str,
     preset: str = "none",
     setpoint: float | None = 21.0,
-    current: float = 20.5,
-    **extra: object,
+    step: float | None = None,
 ) -> None:
     """
     Set the climate entity's state as zwave_js reports it.
@@ -107,9 +108,10 @@ def set_climate(
     """
     attributes: dict[str, object] = {
         "preset_mode": preset,
-        "current_temperature": current,
-        **extra,
+        "current_temperature": CURRENT_TEMPERATURE,
     }
+    if step is not None:
+        attributes["target_temp_step"] = step
     if setpoint is not None:
         attributes["temperature"] = setpoint
     hass.states.async_set(CLIMATE_ID, state, attributes)
@@ -256,10 +258,66 @@ async def test_mode_unknown_for_other_states(hass: HomeAssistant) -> None:
 
 
 @pytest.mark.usefixtures("full_spirit")
-async def test_enter_self_regulation_sets_mode_then_setpoint(
-    hass: HomeAssistant, calls: list[ServiceCall]
+@pytest.mark.parametrize("preset", ["Energy heat", "Full power"])
+async def test_mode_unknown_for_heat_presets(hass: HomeAssistant, preset: str) -> None:
+    """Presets that share the heat state are not self-regulation."""
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    set_climate(hass, "heat", preset=preset)
+
+    assert trv.mode is TrvMode.UNKNOWN
+
+
+@pytest.mark.usefixtures("full_spirit")
+async def test_mode_self_regulating_without_preset(hass: HomeAssistant) -> None:
+    """Heat without a preset attribute reads as self-regulation."""
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    hass.states.async_set(CLIMATE_ID, "heat", {"temperature": 21.0})
+
+    assert trv.mode is TrvMode.SELF_REGULATING
+
+
+def switch_to_heat_on_mode_write(
+    hass: HomeAssistant,
+    calls: list[ServiceCall],
+    stale_setpoint: float,
+    *,
+    deferred: bool = True,
 ) -> None:
-    """Heat mode is written first; the setpoint write does nothing in mode 31."""
+    """Make the heat mode write report heat, at once or after it returns."""
+
+    def report_heat() -> None:
+        set_climate(hass, "heat", setpoint=stale_setpoint)
+
+    async def handler(call: ServiceCall) -> None:
+        calls.append(call)
+        if deferred:
+            hass.loop.call_soon(report_heat)
+        else:
+            report_heat()
+
+    hass.services.async_register("climate", "set_hvac_mode", handler)
+
+
+@pytest.fixture
+def short_mode_change_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give up waiting for a mode change almost at once."""
+    monkeypatch.setattr(spirit, "MODE_CHANGE_TIMEOUT", 0.01)
+
+
+@pytest.mark.usefixtures("full_spirit")
+@pytest.mark.parametrize("deferred", [False, True])
+async def test_enter_self_regulation_sets_mode_then_setpoint(
+    hass: HomeAssistant,
+    calls: list[ServiceCall],
+    deferred: bool,  # noqa: FBT001
+) -> None:
+    """
+    Once heat mode reads back, the setpoint is written regardless.
+
+    The setpoint reported right after leaving mode 31 is stale, so it is
+    written even when it already equals the target.
+    """
+    switch_to_heat_on_mode_write(hass, calls, stale_setpoint=19.5, deferred=deferred)
     trv = SpiritTrv(hass, CLIMATE_ID)
     set_climate(hass, STATE_UNKNOWN, preset=DIRECT_MODE_PRESET, setpoint=None)
 
@@ -276,6 +334,74 @@ async def test_enter_self_regulation_sets_mode_then_setpoint(
     ]
 
 
+@pytest.mark.usefixtures("full_spirit", "short_mode_change_timeout")
+async def test_setpoint_waits_for_mode_change(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """
+    No setpoint is written until heat mode reads back.
+
+    The next call then writes it even though the reported setpoint matches.
+    """
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    set_climate(hass, STATE_UNKNOWN, preset=DIRECT_MODE_PRESET, setpoint=None)
+
+    assert await trv.enter_self_regulation(19.5) == 1
+    assert [c.service for c in calls] == ["set_hvac_mode"]
+
+    set_climate(hass, "heat", setpoint=19.5)
+    assert await trv.enter_self_regulation(19.5) == 1
+    assert await trv.enter_self_regulation(19.5) == 0
+    assert [c.service for c in calls] == ["set_hvac_mode", "set_temperature"]
+
+
+@pytest.mark.usefixtures("full_spirit")
+async def test_failed_mode_write_skips_setpoint(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """A failed heat mode write sends nothing more."""
+
+    async def fail(call: ServiceCall) -> None:
+        calls.append(call)
+        msg = "asleep"
+        raise HomeAssistantError(msg)
+
+    hass.services.async_register("climate", "set_hvac_mode", fail)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    set_climate(hass, STATE_UNKNOWN, preset=DIRECT_MODE_PRESET, setpoint=None)
+
+    assert await trv.enter_self_regulation(19.5) == 0
+    assert [c.service for c in calls] == ["set_hvac_mode"]
+
+
+@pytest.mark.usefixtures("full_spirit")
+async def test_failed_setpoint_write_is_retried(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """Mode sent but setpoint failed counts one, and the setpoint stays pending."""
+    switch_to_heat_on_mode_write(hass, calls, stale_setpoint=19.5)
+    failing = True
+
+    async def setpoint(call: ServiceCall) -> None:
+        calls.append(call)
+        if failing:
+            msg = "asleep"
+            raise HomeAssistantError(msg)
+
+    hass.services.async_register("climate", "set_temperature", setpoint)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    set_climate(hass, STATE_UNKNOWN, preset=DIRECT_MODE_PRESET, setpoint=None)
+
+    assert await trv.enter_self_regulation(19.5) == 1
+    failing = False
+    assert await trv.enter_self_regulation(19.5) == 1
+    assert [c.service for c in calls] == [
+        "set_hvac_mode",
+        "set_temperature",
+        "set_temperature",
+    ]
+
+
 @pytest.mark.usefixtures("full_spirit")
 async def test_enter_self_regulation_skips_what_already_matches(
     hass: HomeAssistant, calls: list[ServiceCall]
@@ -286,6 +412,26 @@ async def test_enter_self_regulation_skips_what_already_matches(
     assert await trv.enter_self_regulation(21.0) == 0
     assert await trv.enter_self_regulation(19.0) == 1
     assert [c.service for c in calls] == ["set_temperature"]
+
+
+@pytest.mark.usefixtures("full_spirit")
+@pytest.mark.parametrize(
+    ("requested", "step", "written"),
+    [(21.2, None, False), (21.2, 0.1, True), (21.5, None, True), (21.1, 0.1, True)],
+)
+async def test_setpoint_matches_within_half_a_step(
+    hass: HomeAssistant,
+    calls: list[ServiceCall],
+    requested: float,
+    step: float | None,
+    written: bool,  # noqa: FBT001
+) -> None:
+    """A setpoint within half a step of the reported 21.0 °C is not rewritten."""
+    set_climate(hass, "heat", setpoint=21.0, step=step)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+
+    assert await trv.enter_self_regulation(requested) == int(written)
+    assert len(calls) == int(written)
 
 
 @pytest.mark.usefixtures("full_spirit")
