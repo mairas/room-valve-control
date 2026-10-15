@@ -618,15 +618,33 @@ async def test_stopped_room_writes_nothing() -> None:
 
     await room.step(at(15), fresh(20.0, at(15)))
     await room.step(at(120), [])
-    await room.set_target(22.5)
+    await room.set_target(OTHER_TARGET)
     await room.hand_back()
 
     assert trv.calls == []
     assert room.device_writes == writes
     assert room.control_mode is ControlMode.STOPPED
-    assert room.target == TARGET
+    # Kept for the restore, so a reloaded room starts from it.
+    assert room.target == OTHER_TARGET
     assert room.last_output is None
     assert not room.needs_immediate_step(at(120), fresh(20.0, at(120)))
+
+
+async def test_target_set_during_hand_back_is_recorded_not_written() -> None:
+    """A target arriving while the TRVs are handed back waits for nothing."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    gate = close_gates(trv)
+    hand_back = asyncio.create_task(room.hand_back())
+    await trv.suspended.wait()
+
+    await room.set_target(OTHER_TARGET)
+    gate.set()
+    await hand_back
+
+    assert room.target == OTHER_TARGET
+    assert trv.calls == [("heat",), ("setpoint", TARGET)]
 
 
 async def test_target_set_during_fallback_step_is_written_after_it() -> None:
