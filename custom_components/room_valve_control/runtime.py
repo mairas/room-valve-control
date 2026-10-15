@@ -27,7 +27,7 @@ from .const import (
     DOMAIN,
 )
 from .controller import PIController, PIGains
-from .registry import resolve_entity_id
+from .registry import entity_ids
 from .room import Reading, Room, RoomSettings
 
 if TYPE_CHECKING:
@@ -50,21 +50,6 @@ HAND_BACK_TIMEOUT: Final = 15.0
 
 type StepCondition = Callable[[datetime, Sequence[Reading]], bool]
 type RoomValveControlConfigEntry = ConfigEntry[dict[str, RoomRuntime]]
-
-
-def entity_ids(
-    hass: HomeAssistant, registry_ids: Sequence[str]
-) -> tuple[list[str], list[str]]:
-    """Return the entity ids of stored registry ids, and the ids that are gone."""
-    resolved = []
-    missing = []
-    for registry_id in registry_ids:
-        entity_id = resolve_entity_id(hass, registry_id)
-        if entity_id is None:
-            missing.append(registry_id)
-        else:
-            resolved.append(entity_id)
-    return resolved, missing
 
 
 def room_gains(data: Mapping[str, Any]) -> PIGains:

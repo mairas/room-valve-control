@@ -7,12 +7,12 @@ from homeassistant.core import HassJob
 from homeassistant.exceptions import ConfigEntryNotReady
 
 from .const import CONF_TRVS, SUBENTRY_TYPE_ROOM
+from .registry import entity_ids
 from .runtime import (
     RoomRuntime,
     RoomValveControlConfigEntry,
     async_hand_back_all,
     async_hand_back_all_at_stop,
-    entity_ids,
 )
 from .spirit import SpiritEntityError, SpiritTrv
 

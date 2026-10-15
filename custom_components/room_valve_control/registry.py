@@ -11,11 +11,23 @@ from homeassistant.core import callback
 from homeassistant.helpers import entity_registry as er
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from homeassistant.core import HomeAssistant
 
 
 @callback
-def resolve_entity_id(hass: HomeAssistant, registry_id: str) -> str | None:
-    """Return the current entity id of a stored registry id, None if removed."""
-    entry = er.async_get(hass).entities.get_entry(registry_id)
-    return entry.entity_id if entry is not None else None
+def entity_ids(
+    hass: HomeAssistant, registry_ids: Sequence[str]
+) -> tuple[list[str], list[str]]:
+    """Return the entity ids of stored registry ids, and the ids that are gone."""
+    entries = er.async_get(hass).entities
+    resolved = []
+    missing = []
+    for registry_id in registry_ids:
+        entry = entries.get_entry(registry_id)
+        if entry is None:
+            missing.append(registry_id)
+        else:
+            resolved.append(entry.entity_id)
+    return resolved, missing

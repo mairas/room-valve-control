@@ -53,7 +53,7 @@ from .const import (
     RoomParameters,
 )
 from .controller import ENDPOINT_TOLERANCE, VALVE_MAX
-from .registry import resolve_entity_id
+from .registry import entity_ids
 from .spirit import SpiritEntityError, SpiritTrv
 
 if TYPE_CHECKING:
@@ -160,15 +160,6 @@ class _RoomForm:
 def _registry_ids(registry: er.EntityRegistry, entity_ids: list[str]) -> list[str]:
     entries = (registry.async_get(entity_id) for entity_id in entity_ids)
     return list(dict.fromkeys(entry.id for entry in entries if entry is not None))
-
-
-def _current_entity_ids(hass: HomeAssistant, registry_ids: list[str]) -> list[str]:
-    """Return the entity ids of the registry ids that still exist."""
-    return [
-        entity_id
-        for registry_id in registry_ids
-        if (entity_id := resolve_entity_id(hass, registry_id)) is not None
-    ]
 
 
 def _parse(user_input: Mapping[str, Any]) -> _RoomForm:
@@ -355,10 +346,9 @@ class RoomSubentryFlow(ConfigSubentryFlow):
                 subentry.title,
                 {
                     **subentry.data,
-                    CONF_SENSORS: _current_entity_ids(
-                        self.hass, subentry.data[CONF_SENSORS]
-                    ),
-                    CONF_TRVS: _current_entity_ids(self.hass, subentry.data[CONF_TRVS]),
+                    # A removed entity is left out of the form.
+                    CONF_SENSORS: entity_ids(self.hass, subentry.data[CONF_SENSORS])[0],
+                    CONF_TRVS: entity_ids(self.hass, subentry.data[CONF_TRVS])[0],
                 },
             ),
             user_input,
