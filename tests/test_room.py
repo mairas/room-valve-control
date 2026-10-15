@@ -358,6 +358,27 @@ async def test_trv_switched_out_of_direct_is_reentered_and_logged(
     assert "living room" in warnings(caplog)[0].getMessage()
 
 
+async def test_external_change_warning_names_the_trv(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """In a multi-TRV room the warning says which TRV left direct mode."""
+    trvs = [
+        FakeTrv(name="climate.window", valve=0.0),
+        FakeTrv(name="climate.door", valve=0.0),
+    ]
+    room = make_room(trvs)
+    await go_direct(room, *trvs)
+
+    trvs[1].mode = TrvMode.SELF_REGULATING
+    with caplog.at_level(logging.WARNING):
+        await room.step(at(15), fresh(20.0, at(15)))
+
+    assert len(warnings(caplog)) == 1
+    message = warnings(caplog)[0].getMessage()
+    assert "climate.door" in message
+    assert "climate.window" not in message
+
+
 async def test_trv_reentered_after_fallback_is_not_logged(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
