@@ -1,5 +1,6 @@
 """Config flow for the Room Valve Control integration, one subentry per room."""
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, override
 
 import voluptuous as vol
@@ -46,18 +47,21 @@ from .const import (
     DEFAULT_TI,
     DOMAIN,
     SUBENTRY_TYPE_ROOM,
+    RoomConfig,
+    RoomParameters,
 )
 from .controller import ENDPOINT_TOLERANCE, VALVE_MAX
 from .spirit import SpiritEntityError, SpiritTrv
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+    from datetime import timedelta
 
 DURATION_FIELDS: Final = (CONF_TI, CONF_CONTROL_STEP, CONF_STALE_TIMEOUT)
 SECONDS_PER_MINUTE: Final = 60
 SECONDS_PER_HOUR: Final = 3600
 
-DEFAULT_ROOM: Final[dict[str, Any]] = {
+DEFAULT_ROOM: Final[RoomParameters] = {
     CONF_KP: DEFAULT_KP,
     CONF_TI: DEFAULT_TI.total_seconds(),
     CONF_CONTROL_STEP: DEFAULT_CONTROL_STEP.total_seconds(),
@@ -132,24 +136,61 @@ def _form_values(name: str | None, room: Mapping[str, Any]) -> dict[str, Any]:
     return values
 
 
-def _parse(user_input: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
-    """Split the form into the room's name and its stored data."""
-    room = {key: value for key, value in user_input.items() if key != CONF_NAME}
-    for key in DURATION_FIELDS:
-        room[key] = cv.time_period_dict(room[key]).total_seconds()
-    return user_input[CONF_NAME], room
+@dataclass(frozen=True)
+class _RoomForm:
+    """A submitted room form, its durations in seconds."""
+
+    name: str
+    sensors: list[str]
+    trvs: list[str]
+    parameters: RoomParameters
+
+    def config(self) -> RoomConfig:
+        """Return the room's subentry data."""
+        return {
+            **self.parameters,
+            CONF_SENSORS: self.sensors,
+            CONF_TRVS: self.trvs,
+        }
 
 
-def _parameter_errors(room: Mapping[str, Any]) -> dict[str, str]:
+def _parse(user_input: Mapping[str, Any]) -> _RoomForm:
+    def seconds(key: str) -> float:
+        period: timedelta = cv.time_period_dict(user_input[key])
+        return period.total_seconds()
+
+    return _RoomForm(
+        name=user_input[CONF_NAME],
+        sensors=user_input[CONF_SENSORS],
+        trvs=user_input[CONF_TRVS],
+        parameters={
+            CONF_KP: user_input[CONF_KP],
+            CONF_TI: seconds(CONF_TI),
+            CONF_CONTROL_STEP: seconds(CONF_CONTROL_STEP),
+            CONF_MIN_CHANGE: user_input[CONF_MIN_CHANGE],
+            CONF_STALE_TIMEOUT: seconds(CONF_STALE_TIMEOUT),
+            CONF_MIN_TARGET: user_input[CONF_MIN_TARGET],
+            CONF_MAX_TARGET: user_input[CONF_MAX_TARGET],
+        },
+    )
+
+
+def _parameter_errors(parameters: RoomParameters) -> dict[str, str]:
     errors: dict[str, str] = {}
-    for key in (CONF_KP, *DURATION_FIELDS):
-        if room[key] <= 0:
+    positive = {
+        CONF_KP: parameters[CONF_KP],
+        CONF_TI: parameters[CONF_TI],
+        CONF_CONTROL_STEP: parameters[CONF_CONTROL_STEP],
+        CONF_STALE_TIMEOUT: parameters[CONF_STALE_TIMEOUT],
+    }
+    for key, value in positive.items():
+        if value <= 0:
             errors[key] = "not_positive"
     # At or below the endpoint tolerance a valve near 0 or 99 would never be
     # driven to the endpoint while a mid-range move of the same size would be.
-    if not ENDPOINT_TOLERANCE < room[CONF_MIN_CHANGE] <= VALVE_MAX:
+    if not ENDPOINT_TOLERANCE < parameters[CONF_MIN_CHANGE] <= VALVE_MAX:
         errors[CONF_MIN_CHANGE] = "min_change_out_of_range"
-    if room[CONF_MIN_TARGET] >= room[CONF_MAX_TARGET]:
+    if parameters[CONF_MIN_TARGET] >= parameters[CONF_MAX_TARGET]:
         errors[CONF_MAX_TARGET] = "target_range_empty"
     return errors
 
@@ -191,15 +232,15 @@ def _trv_error(
 def _validate(
     hass: HomeAssistant,
     entry: ConfigEntry,
-    room: Mapping[str, Any],
+    room: _RoomForm,
     own_subentry_id: str | None,
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Return the form's errors by field and the placeholders they use."""
-    errors = _parameter_errors(room)
-    if not room[CONF_SENSORS]:
+    errors = _parameter_errors(room.parameters)
+    if not room.sensors:
         errors[CONF_SENSORS] = "no_sensor"
     placeholders: dict[str, str] = {}
-    if trv_error := _trv_error(hass, entry, room[CONF_TRVS], own_subentry_id):
+    if trv_error := _trv_error(hass, entry, room.trvs, own_subentry_id):
         errors[CONF_TRVS], placeholders = trv_error
     return errors, placeholders
 
@@ -237,10 +278,10 @@ class RoomSubentryFlow(ConfigSubentryFlow):
         errors: dict[str, str] = {}
         placeholders: dict[str, str] = {}
         if user_input is not None:
-            name, room = _parse(user_input)
+            room = _parse(user_input)
             errors, placeholders = _validate(self.hass, self._get_entry(), room, None)
             if not errors:
-                return self.async_create_entry(title=name, data=room)
+                return self.async_create_entry(title=room.name, data=room.config())
         return self._show_room_form(
             "user", _form_values(None, DEFAULT_ROOM), user_input, errors, placeholders
         )
@@ -254,13 +295,13 @@ class RoomSubentryFlow(ConfigSubentryFlow):
         errors: dict[str, str] = {}
         placeholders: dict[str, str] = {}
         if user_input is not None:
-            name, room = _parse(user_input)
+            room = _parse(user_input)
             errors, placeholders = _validate(
                 self.hass, entry, room, subentry.subentry_id
             )
             if not errors:
                 return self.async_update_and_abort(
-                    entry, subentry, title=name, data=room
+                    entry, subentry, title=room.name, data=room.config()
                 )
         return self._show_room_form(
             "reconfigure",
