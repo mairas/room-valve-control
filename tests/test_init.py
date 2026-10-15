@@ -38,10 +38,12 @@ from .live_room import (
     async_advance,
     async_set_room_target,
     async_setup_room,
+    async_setup_rooms,
     async_setup_spirits,
     async_wait_for,
     register_sensor,
     registry_ids,
+    room_subentry,
 )
 
 if TYPE_CHECKING:
@@ -57,6 +59,9 @@ OTHER_TARGET: Final = 22.0
 RELOAD_DELAY: Final = timedelta(seconds=RELOAD_AFTER_UPDATE_DELAY + 1)
 # Off the TRVs' own setpoint, so a fallback step writes it.
 FALLBACK_TARGET: Final = 20.5
+OTHER_ROOM_ID: Final = "bedroom_subentry"
+OTHER_ROOM_TITLE: Final = "Bedroom"
+OTHER_ROOM_CLIMATE: Final = "climate.bedroom"
 RENAMED_SENSOR: Final = "sensor.lounge_temperature"
 LOWER_READING: Final = "19.5"
 OTHER_SENSOR: Final = "sensor.living_room_window_temperature"
@@ -406,6 +411,69 @@ async def test_target_shows_while_a_step_is_stalled(hass: HomeAssistant) -> None
 
 
 @pytest.mark.usefixtures("zwave_js_flow")
+async def test_rooms_are_handed_back_concurrently(hass: HomeAssistant) -> None:
+    """Two rooms run side by side, and one stalled hand back holds up neither."""
+    calls: list[TrvCall] = []
+    trvs = await async_setup_spirits(hass, calls)
+    sensors = registry_ids(hass, [WALL_SENSOR])
+    entry = await async_setup_rooms(
+        hass,
+        [
+            room_subentry(
+                ROOM_ID,
+                ROOM_TITLE,
+                sensors=sensors,
+                trvs=registry_ids(hass, [TRVS[0].climate]),
+            ),
+            room_subentry(
+                OTHER_ROOM_ID,
+                OTHER_ROOM_TITLE,
+                sensors=sensors,
+                trvs=registry_ids(hass, [TRVS[1].climate]),
+            ),
+        ],
+    )
+    hass.states.async_set(WALL_SENSOR, READING)
+    await async_set_room_target(hass, TARGET)
+    await async_set_room_target(hass, TARGET, OTHER_ROOM_CLIMATE)
+    assert sorted(calls) == sorted(entering_direct())
+    calls.clear()
+    stall = asyncio.Event()
+    trvs[0].stall = stall
+
+    unload = hass.async_create_task(hass.config_entries.async_unload(entry.entry_id))
+    await async_wait_for(lambda: ("set_temperature", TRVS[1].climate, TARGET) in calls)
+
+    assert ("set_temperature", TRVS[0].climate, TARGET) not in calls
+    stall.set()
+    assert await unload
+    assert sorted(calls) == sorted(handing_back())
+
+
+@pytest.mark.usefixtures("zwave_js_flow")
+async def test_trvs_unavailable_at_setup_are_driven_once_available(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """A room set up while Z-Wave JS is not ready starts writing when it is."""
+    calls: list[TrvCall] = []
+    trvs = await async_setup_spirits(hass, calls)
+    for trv in trvs:
+        trv.set_available(available=False)
+    entry = await async_setup_room(hass)
+    hass.states.async_set(WALL_SENSOR, READING)
+    await async_set_room_target(hass, TARGET)
+    assert entry.state is ConfigEntryState.LOADED
+    assert calls == []
+
+    for trv in trvs:
+        trv.set_available(available=True)
+    await async_advance(hass, freezer)
+
+    assert ("set_preset_mode", TRVS[0].climate, DIRECT_MODE_PRESET) in calls
+    assert ("set_preset_mode", TRVS[1].climate, DIRECT_MODE_PRESET) in calls
+
+
+@pytest.mark.usefixtures("zwave_js_flow")
 async def test_removed_trv_leaves_the_entry_not_ready(hass: HomeAssistant) -> None:
     """A TRV whose registry entry is gone needs the room reconfigured."""
     await async_setup_spirits(hass, [])
@@ -556,6 +624,29 @@ async def test_reload_hands_back_once(
     handed_back = handing_back()
     assert calls[: len(handed_back)] == handed_back
     assert ("set_hvac_mode", TRVS[0].climate, "heat") not in calls[len(handed_back) :]
+
+
+async def test_stop_after_reload_hands_back_once(
+    hass: HomeAssistant, calls: list[TrvCall]
+) -> None:
+    """The reloaded entry's shutdown job alone hands the TRVs back at Core stop."""
+    entry = await async_setup_room(hass)
+    hass.states.async_set(WALL_SENSOR, READING)
+    await async_set_room_target(hass, TARGET)
+    subentry = entry.subentries[ROOM_ID]
+    hass.config_entries.async_update_subentry(
+        entry, subentry, data={**subentry.data, CONF_KP: 40.0}
+    )
+    await hass.async_block_till_done(wait_background_tasks=True)
+    calls.clear()
+    hass.states.async_set(WALL_SENSOR, READING, force_update=True)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert ("set_preset_mode", TRVS[0].climate, DIRECT_MODE_PRESET) in calls
+    calls.clear()
+
+    await hass.async_stop()
+
+    assert sorted(calls) == sorted(handing_back())
 
 
 @pytest.mark.usefixtures("calls")
