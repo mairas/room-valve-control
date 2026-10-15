@@ -48,6 +48,7 @@ TRV_2: Final = "climate.bedroom_trv_2"
 DISABLED_OFFSET_TRV: Final = "climate.office_trv"
 DISABLED_OFFSET_ID: Final = "number.office_trv_temperature_offset"
 NOT_A_SPIRIT: Final = "climate.heat_pump"
+DEVICELESS_TRV: Final = "climate.deviceless_trv"
 ZERO_DURATION: Final = {"hours": 0, "minutes": 0, "seconds": 0}
 
 DEFAULT_ROOM_DATA: Final = {
@@ -68,6 +69,7 @@ ERROR_KEYS: Final = (
     "trv_in_use",
     "trv_entity_missing",
     "trv_entity_disabled",
+    "trv_no_device",
     "not_positive",
     "min_change_out_of_range",
     "target_range_empty",
@@ -265,6 +267,23 @@ async def test_climate_that_is_not_a_spirit_is_refused(hass: HomeAssistant) -> N
     assert placeholders is not None
     assert placeholders["trv"] == NOT_A_SPIRIT
     assert placeholders["entity"] == "climate"
+
+
+async def test_climate_without_device_is_refused(hass: HomeAssistant) -> None:
+    """A climate entity that belongs to no device is refused as deviceless."""
+    er.async_get(hass).async_get_or_create(
+        "climate", "test", "deviceless", suggested_object_id="deviceless_trv"
+    )
+    entry = await _add_entry(hass)
+
+    result = await _create_room(
+        hass, entry, _room_input(**{CONF_TRVS: [DEVICELESS_TRV]})
+    )
+
+    assert result["errors"] == {CONF_TRVS: "trv_no_device"}
+    placeholders = result["description_placeholders"]
+    assert placeholders is not None
+    assert placeholders["trv"] == DEVICELESS_TRV
 
 
 async def test_trv_in_another_room_is_refused(hass: HomeAssistant) -> None:
