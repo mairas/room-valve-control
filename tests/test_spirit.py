@@ -1,5 +1,6 @@
 """Tests for the Eurotronic Spirit TRV adapter."""
 
+import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
@@ -31,6 +32,8 @@ OFFSET_ID: Final = "number.living_room_trv_temperature_offset"
 CLIMATE_UNIQUE_ID: Final = f"{HOME_ID}.{NODE_ID}-64-0-mode"
 VALVE_UNIQUE_ID: Final = f"{HOME_ID}.{NODE_ID}-38-0-currentValue"
 OFFSET_UNIQUE_ID: Final = f"{HOME_ID}.{NODE_ID}-112-0-8"
+NODE_STATUS_ID: Final = "sensor.living_room_trv_node_status"
+NODE_STATUS_UNIQUE_ID: Final = f"{HOME_ID}.{NODE_ID}.node_status"
 CURRENT_TEMPERATURE: Final = 20.5
 ADAPTER_SERVICES: Final = (
     ("climate", "set_preset_mode"),
@@ -539,3 +542,96 @@ async def test_failed_service_reports_not_sent(
     assert not await trv.set_offset(1.0)
     assert "set_preset_mode failed" in caplog.text
     assert "set_config_parameter failed" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("status", "available"),
+    [("dead", False), ("alive", True), ("asleep", True), ("unknown", True)],
+)
+async def test_node_status_decides_availability(
+    hass: HomeAssistant,
+    full_spirit: Spirit,
+    calls: list[ServiceCall],
+    status: str,
+    available: bool,  # noqa: FBT001
+) -> None:
+    """A dead node is unavailable although its entities still report."""
+    _add_entity(full_spirit, "sensor", NODE_STATUS_UNIQUE_ID, NODE_STATUS_ID)
+    hass.states.async_set(NODE_STATUS_ID, status)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+
+    assert trv.available is available
+    assert await trv.set_valve(50) is available
+    assert len(calls) == int(available)
+
+
+async def test_disabled_node_status_falls_back_to_climate(
+    hass: HomeAssistant, full_spirit: Spirit
+) -> None:
+    """Without a node status reading, availability is the climate entity's."""
+    _add_entity(
+        full_spirit,
+        "sensor",
+        NODE_STATUS_UNIQUE_ID,
+        NODE_STATUS_ID,
+        disabled_by=er.RegistryEntryDisabler.USER,
+    )
+    trv = SpiritTrv(hass, CLIMATE_ID)
+
+    assert trv.available
+    hass.states.async_set(CLIMATE_ID, STATE_UNAVAILABLE)
+    assert not trv.available
+
+
+@pytest.mark.usefixtures("full_spirit")
+@pytest.mark.parametrize("error", [ValueError, KeyError])
+async def test_entity_errors_report_not_sent(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+    error: type[Exception],
+) -> None:
+    """zwave_js raises ValueError and KeyError outside HomeAssistantError."""
+
+    async def fail(call: ServiceCall) -> None:
+        raise error(call.service)
+
+    hass.services.async_register("climate", "set_temperature", fail)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+
+    assert await trv.enter_self_regulation(19.0) == 0
+    assert "set_temperature failed" in caplog.text
+
+
+@pytest.mark.usefixtures("full_spirit")
+async def test_stalled_service_times_out(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A write that never completes is abandoned and reported not sent."""
+    monkeypatch.setattr(spirit, "SERVICE_TIMEOUT", 0.01)
+
+    async def stall(_call: ServiceCall) -> None:
+        await asyncio.Event().wait()
+
+    hass.services.async_register("number", "set_value", stall)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+
+    assert not await trv.set_valve(50)
+    assert "set_value timed out" in caplog.text
+
+
+@pytest.mark.usefixtures("full_spirit")
+@pytest.mark.parametrize("valve_state", [STATE_UNAVAILABLE, None])
+async def test_set_valve_needs_valve_entity_state(
+    hass: HomeAssistant, calls: list[ServiceCall], valve_state: str | None
+) -> None:
+    """An unavailable or stateless valve entity is not written."""
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    if valve_state is None:
+        hass.states.async_remove(VALVE_ID)
+    else:
+        hass.states.async_set(VALVE_ID, valve_state)
+
+    assert not await trv.set_valve(50)
+    assert calls == []
