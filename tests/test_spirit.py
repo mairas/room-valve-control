@@ -655,3 +655,42 @@ async def test_own_temperature_waits_for_report_after_offset_write(
     freezer.tick(1)
     set_climate(hass, "heat")
     assert trv.own_temperature == pytest.approx(CURRENT_TEMPERATURE - 0.5)
+
+
+async def test_reads_follow_renames_while_loaded(
+    hass: HomeAssistant, full_spirit: Spirit, calls: list[ServiceCall]
+) -> None:
+    """Entity ids are looked up by unique id, so a rename keeps working."""
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    registry = full_spirit.entity_registry
+    registry.async_update_entity(CLIMATE_ID, new_entity_id="climate.renamed")
+    registry.async_update_entity(VALVE_ID, new_entity_id="number.renamed_valve")
+    registry.async_update_entity(OFFSET_ID, new_entity_id="number.renamed_offset")
+    hass.states.async_set("climate.renamed", "heat", {"temperature": 21.0})
+    hass.states.async_set("number.renamed_valve", "55.0")
+    hass.states.async_set("number.renamed_offset", "3.0")
+
+    assert trv.climate_entity_id == "climate.renamed"
+    assert trv.valve_entity_id == "number.renamed_valve"
+    assert trv.offset_entity_id == "number.renamed_offset"
+    assert trv.available
+    assert trv.valve == pytest.approx(55.0)
+    assert trv.offset == pytest.approx(0.3)
+    assert await trv.set_valve(60)
+    assert calls[0].data["entity_id"] == "number.renamed_valve"
+
+
+async def test_climate_entity_without_device_fails(hass: HomeAssistant) -> None:
+    """A deviceless climate entity is reported as such, not as missing."""
+    er.async_get(hass).async_get_or_create(
+        "climate", ZWAVE_JS, CLIMATE_UNIQUE_ID, suggested_object_id="living_room_trv"
+    )
+
+    with pytest.raises(SpiritEntityError) as excinfo:
+        SpiritTrv(hass, CLIMATE_ID)
+
+    assert excinfo.value.entity is SpiritEntity.CLIMATE
+    assert excinfo.value.entity_id == CLIMATE_ID
+    assert excinfo.value.no_device
+    assert not excinfo.value.disabled
+    assert "has no device" in str(excinfo.value)
