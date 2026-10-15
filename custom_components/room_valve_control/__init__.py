@@ -11,6 +11,7 @@ from .runtime import (
     RoomRuntime,
     RoomValveControlConfigEntry,
     async_hand_back_all,
+    async_hand_back_all_at_stop,
     entity_ids,
 )
 from .spirit import SpiritEntityError, SpiritTrv
@@ -41,14 +42,14 @@ async def async_setup_entry(
         except SpiritEntityError as err:
             msg = f"{subentry.title}: {err}"
             raise ConfigEntryNotReady(msg) from err
-        rooms[subentry.subentry_id] = RoomRuntime(hass, subentry, trvs)
+        rooms[subentry.subentry_id] = RoomRuntime(hass, entry, subentry, trvs)
     entry.runtime_data = rooms
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     # A shutdown job rather than a stop event listener: zwave_js disconnects on
     # the stop event, and shutdown jobs finish before it fires.
     entry.async_on_unload(
         hass.async_add_shutdown_job(
-            HassJob(async_hand_back_all, "room_valve_control hand back"),
+            HassJob(async_hand_back_all_at_stop, "room_valve_control hand back"),
             rooms.values(),
         )
     )
