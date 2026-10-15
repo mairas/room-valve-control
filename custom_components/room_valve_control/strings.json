@@ -88,5 +88,30 @@
         "reconfigure_successful": "The room was reconfigured."
       }
     }
+  },
+  "entity": {
+    "sensor": {
+      "output": {
+        "name": "Valve output"
+      },
+      "integrator": {
+        "name": "Integrator"
+      },
+      "error": {
+        "name": "Control error"
+      },
+      "control_mode": {
+        "name": "Control mode",
+        "state": {
+          "waiting": "Waiting for a reading",
+          "direct": "Direct valve control",
+          "fallback": "TRV self-regulation",
+          "stopped": "Handed back to the TRVs"
+        }
+      },
+      "device_writes": {
+        "name": "Device writes"
+      }
+    }
   }
 }
