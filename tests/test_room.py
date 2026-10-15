@@ -645,6 +645,78 @@ async def test_target_set_during_fallback_step_is_written_after_it() -> None:
     assert trv.calls == [("heat",), ("setpoint", TARGET), ("setpoint", 22.5)]
 
 
+async def test_hand_back_writes_trvs_concurrently() -> None:
+    """Each TRV's slow mode change does not hold up the others."""
+    trvs = [FakeTrv(valve=0.0), FakeTrv(valve=0.0)]
+    room = make_room(trvs)
+    await go_direct(room, *trvs)
+    gate = close_gates(*trvs)
+
+    hand_back = asyncio.create_task(room.hand_back())
+    await asyncio.wait_for(
+        asyncio.gather(*(trv.suspended.wait() for trv in trvs)), timeout=1
+    )
+    gate.set()
+    await hand_back
+
+    assert all(trv.mode is TrvMode.SELF_REGULATING for trv in trvs)
+
+
+async def test_fallback_writes_trvs_concurrently() -> None:
+    """Falling back does not wait for one TRV's mode change to start the next."""
+    trvs = [FakeTrv(valve=0.0), FakeTrv(valve=0.0)]
+    room = make_room(trvs)
+    await go_direct(room, *trvs)
+    gate = close_gates(*trvs)
+
+    step = asyncio.create_task(room.step(at(90), []))
+    await asyncio.wait_for(
+        asyncio.gather(*(trv.suspended.wait() for trv in trvs)), timeout=1
+    )
+    gate.set()
+    await step
+
+    assert all(trv.setpoint == TARGET for trv in trvs)
+
+
+async def test_hand_back_retries_a_deferred_setpoint_once() -> None:
+    """A mode that reads back late gets a second call, which writes the setpoint."""
+    trvs = [FakeTrv(valve=0.0), FakeTrv(valve=0.0)]
+    room = make_room(trvs)
+    await go_direct(room, *trvs)
+    trvs[0].deferred_readbacks = 1
+    writes = room.device_writes
+
+    await room.hand_back()
+
+    assert trvs[0].calls == [("heat",), ("heat",), ("setpoint", TARGET)]
+    assert trvs[1].calls == [("heat",), ("setpoint", TARGET)]
+    assert room.device_writes == writes + 5
+
+
+async def test_hand_back_retry_is_bounded() -> None:
+    """A TRV whose mode never reads back is called twice, not more."""
+    trv = FakeTrv(valve=0.0, deferred_readbacks=5)
+    room = make_room([trv])
+    await go_direct(room, trv)
+
+    await room.hand_back()
+
+    assert trv.calls == [("heat",), ("heat",)]
+
+
+async def test_hand_back_does_not_retry_an_unsent_write() -> None:
+    """A call that sent nothing is not retried; the device is not taking writes."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    trv.sends = False
+
+    await room.hand_back()
+
+    assert trv.calls == [("heat",)]
+
+
 @pytest.mark.parametrize(
     ("offset", "written"),
     [(None, True), (0.2, True), (0.3, False), (0.5, False), (0.9, True)],
