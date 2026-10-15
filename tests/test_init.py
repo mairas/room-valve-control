@@ -63,7 +63,10 @@ OTHER_ROOM_ID: Final = "bedroom_subentry"
 OTHER_ROOM_TITLE: Final = "Bedroom"
 OTHER_ROOM_CLIMATE: Final = "climate.bedroom"
 RENAMED_SENSOR: Final = "sensor.lounge_temperature"
+# 1.5 °C below TARGET: 45 % from Kp 30, with nothing integrated yet.
 LOWER_READING: Final = "19.5"
+LOWER_OUTPUT: Final = 45
+CHANGED_KP: Final = 40.0
 OTHER_SENSOR: Final = "sensor.living_room_window_temperature"
 RENAMED_CLIMATE: Final = "climate.lounge"
 INTEGRATOR_SENSOR: Final = "sensor.living_room_integrator"
@@ -135,7 +138,7 @@ async def test_unknown_sensor_writes_nothing_until_stale_timeout(
     """Without a reading the TRVs are left alone until the stale timeout."""
     hass.states.async_set(WALL_SENSOR, STATE_UNKNOWN)
     await async_setup_room(hass)
-    await async_set_room_target(hass, 20.5)
+    await async_set_room_target(hass, FALLBACK_TARGET)
 
     for _ in range(STEPS_IN_STARTUP_GRACE):
         await async_advance(hass, freezer)
@@ -143,7 +146,7 @@ async def test_unknown_sensor_writes_nothing_until_stale_timeout(
 
     await async_advance(hass, freezer)
 
-    assert calls == [("set_temperature", ids.climate, 20.5) for ids in TRVS]
+    assert calls == [("set_temperature", ids.climate, FALLBACK_TARGET) for ids in TRVS]
 
 
 async def test_fresh_reading_steps_at_once(
@@ -189,14 +192,14 @@ async def test_reading_change_in_direct_waits_for_next_step(
     await async_set_room_target(hass, TARGET)
     calls.clear()
 
-    hass.states.async_set(WALL_SENSOR, "19.5")
+    hass.states.async_set(WALL_SENSOR, LOWER_READING)
     await hass.async_block_till_done(wait_background_tasks=True)
     assert calls == []
 
     await async_advance(hass, freezer)
 
     # 1.5 °C error: 45 % proportional; the first step integrated nothing.
-    assert calls == [("set_value", ids.valve, 45) for ids in TRVS]
+    assert calls == [("set_value", ids.valve, LOWER_OUTPUT) for ids in TRVS]
 
 
 async def test_unchanged_value_reported_after_fallback_steps_back_to_direct(
@@ -618,7 +621,7 @@ async def test_reload_hands_back_once(
     subentry = entry.subentries[ROOM_ID]
 
     hass.config_entries.async_update_subentry(
-        entry, subentry, data={**subentry.data, CONF_KP: 40.0}
+        entry, subentry, data={**subentry.data, CONF_KP: CHANGED_KP}
     )
     await hass.async_block_till_done(wait_background_tasks=True)
 
@@ -636,7 +639,7 @@ async def test_stop_after_reload_hands_back_once(
     await async_set_room_target(hass, TARGET)
     subentry = entry.subentries[ROOM_ID]
     hass.config_entries.async_update_subentry(
-        entry, subentry, data={**subentry.data, CONF_KP: 40.0}
+        entry, subentry, data={**subentry.data, CONF_KP: CHANGED_KP}
     )
     await hass.async_block_till_done(wait_background_tasks=True)
     calls.clear()
@@ -666,7 +669,7 @@ async def test_reload_does_not_integrate_a_step(
     subentry = entry.subentries[ROOM_ID]
 
     hass.config_entries.async_update_subentry(
-        entry, subentry, data={**subentry.data, CONF_KP: 40.0}
+        entry, subentry, data={**subentry.data, CONF_KP: CHANGED_KP}
     )
     await hass.async_block_till_done(wait_background_tasks=True)
     hass.states.async_set(WALL_SENSOR, READING, force_update=True)
@@ -692,7 +695,7 @@ async def test_target_set_during_reload_is_kept(hass: HomeAssistant) -> None:
     trvs[0].stall = stall
     subentry = entry.subentries[ROOM_ID]
     hass.config_entries.async_update_subentry(
-        entry, subentry, data={**subentry.data, CONF_KP: 40.0}
+        entry, subentry, data={**subentry.data, CONF_KP: CHANGED_KP}
     )
     await async_wait_for(lambda: ("set_hvac_mode", TRVS[0].climate, "heat") in calls)
 
@@ -723,10 +726,10 @@ async def test_renamed_climate_entity_keeps_the_room_running(
     er.async_get(hass).async_update_entity(ROOM_CLIMATE, new_entity_id=RENAMED_CLIMATE)
     await hass.async_block_till_done(wait_background_tasks=True)
     renamed = hass.states.get(RENAMED_CLIMATE)
-    hass.states.async_set(WALL_SENSOR, "19.5")
+    hass.states.async_set(WALL_SENSOR, LOWER_READING)
     await async_advance(hass, freezer)
 
     assert renamed is not None
     assert renamed.attributes[ATTR_TEMPERATURE] == TARGET
     # One step on the single, still running room: see the direct-mode test.
-    assert calls == [("set_value", ids.valve, 45) for ids in TRVS]
+    assert calls == [("set_value", ids.valve, LOWER_OUTPUT) for ids in TRVS]

@@ -29,6 +29,11 @@ ERROR: Final = "sensor.living_room_control_error"
 MODE: Final = "sensor.living_room_control_mode"
 WRITES: Final = "sensor.living_room_device_writes"
 SENSORS: Final = (OUTPUT, INTEGRATOR, ERROR, MODE, WRITES)
+TARGET: Final = 21.0
+READING: Final = "20.0"
+# Kp 30 x 1 °C; one 15 min interval at Ti 30 min integrates half of it.
+STEP_OUTPUT: Final = 30
+STEP_INTEGRAL: Final = 15.0
 
 
 def state_of(hass: HomeAssistant, entity_id: str) -> str:
@@ -89,14 +94,13 @@ async def test_sensors_show_the_step(
 ) -> None:
     """After direct steps the sensors show what they computed and wrote."""
     await async_setup_room(hass)
-    hass.states.async_set(WALL_SENSOR, "20.0")
-    await async_set_room_target(hass, 21.0)
+    hass.states.async_set(WALL_SENSOR, READING)
+    await async_set_room_target(hass, TARGET)
 
     await async_advance(hass, freezer)
 
-    # Kp 30 x 1 °C; one 15 min interval at Ti 30 min integrates half of it.
-    assert int(state_of(hass, OUTPUT)) == 30  # noqa: PLR2004
-    assert float(state_of(hass, INTEGRATOR)) == 15  # noqa: PLR2004
-    assert float(state_of(hass, ERROR)) == 1
+    assert int(state_of(hass, OUTPUT)) == STEP_OUTPUT
+    assert float(state_of(hass, INTEGRATOR)) == STEP_INTEGRAL
+    assert float(state_of(hass, ERROR)) == TARGET - float(READING)
     assert state_of(hass, MODE) == "direct"
     assert int(state_of(hass, WRITES)) == len(calls) > 0
