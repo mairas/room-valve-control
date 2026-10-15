@@ -1,5 +1,8 @@
 """Tests for the PI controller and the valve write decision."""
 
+import math
+import random
+from dataclasses import dataclass
 from datetime import timedelta
 
 import pytest
@@ -174,3 +177,96 @@ def test_from_dict_rejects_malformed_state(data: dict[str, object]) -> None:
     """Stored state without a numeric integrator is refused."""
     with pytest.raises(TypeError, match="integral"):
         PIController.from_dict(GAINS, data)
+
+
+# Simulation: starting gains, to be updated when Unit 1 converts the old ones.
+SIM_KP = 30.0
+SIM_TI = timedelta(hours=2)
+SIM_SEED = 20261016
+SIM_WARMUP = timedelta(days=1)
+SIM_DURATION = timedelta(days=7)
+SIM_SUBSTEP = timedelta(minutes=1)
+WRITES_PER_DAY_LIMIT = 72
+
+ROOM_TIME_CONSTANT = timedelta(hours=8)
+HEATING_AT_FULL_VALVE = 4.0  # °C/h with the valve at 100 %
+OUTDOOR_MEAN = 5.0
+OUTDOOR_SWING = 3.0
+SOLAR_GAIN_PEAK = 1.0  # °C/h at midday
+SENSOR_NOISE = 0.05
+OUTDOOR_COLDEST_HOUR = 5.0
+SOLAR_RISE_HOUR = 8.0
+SOLAR_SET_HOUR = 16.0
+FULL_VALVE = 100.0
+HOURS_PER_DAY = 24.0
+SECONDS_PER_HOUR = 3600.0
+
+
+@dataclass(frozen=True)
+class SimulationResult:
+    """Outcome of a simulated period of direct control."""
+
+    writes_per_day: float
+    mean_abs_error: float
+
+
+def _room_drift(hour_of_day: float, temperature: float, valve: float) -> float:
+    """Return the room temperature change rate in °C/h."""
+    outdoor = OUTDOOR_MEAN - OUTDOOR_SWING * math.cos(
+        2 * math.pi * (hour_of_day - OUTDOOR_COLDEST_HOUR) / HOURS_PER_DAY
+    )
+    solar = 0.0
+    if SOLAR_RISE_HOUR < hour_of_day < SOLAR_SET_HOUR:
+        solar = SOLAR_GAIN_PEAK * math.sin(
+            math.pi
+            * (hour_of_day - SOLAR_RISE_HOUR)
+            / (SOLAR_SET_HOUR - SOLAR_RISE_HOUR)
+        )
+    tau_hours = ROOM_TIME_CONSTANT.total_seconds() / SECONDS_PER_HOUR
+    loss = (temperature - outdoor) / tau_hours
+    return HEATING_AT_FULL_VALVE * valve / FULL_VALVE + solar - loss
+
+
+def simulate(gains: PIGains) -> SimulationResult:
+    """Run direct control on a first-order room model with noise and disturbances."""
+    rng = random.Random(SIM_SEED)  # noqa: S311 - seeded for a repeatable run
+    controller = PIController(gains)
+    temperature = TARGET
+    valve = VALVE_MIN
+    writes = 0
+    abs_errors: list[float] = []
+    substeps = int(STEP / SIM_SUBSTEP)
+    substep_hours = SIM_SUBSTEP.total_seconds() / SECONDS_PER_HOUR
+    warmup_steps = int(SIM_WARMUP / STEP)
+    total_steps = int((SIM_WARMUP + SIM_DURATION) / STEP)
+
+    for step in range(total_steps):
+        reading = temperature + rng.uniform(-SENSOR_NOISE, SENSOR_NOISE)
+        output = controller.step(TARGET, reading, STEP, integrate=True)
+        measured = step >= warmup_steps
+        if should_write_valve(output, valve, MIN_CHANGE):
+            valve = output
+            writes += measured
+        for substep in range(substeps):
+            elapsed = step * STEP + substep * SIM_SUBSTEP
+            hour_of_day = (elapsed.total_seconds() / SECONDS_PER_HOUR) % HOURS_PER_DAY
+            temperature += _room_drift(hour_of_day, temperature, valve) * substep_hours
+        if measured:
+            abs_errors.append(abs(TARGET - temperature))
+
+    days = SIM_DURATION / timedelta(days=1)
+    return SimulationResult(
+        writes_per_day=writes / days,
+        mean_abs_error=sum(abs_errors) / len(abs_errors),
+    )
+
+
+def test_simulated_week_stays_within_write_budget() -> None:
+    """A week of direct control at the starting gains stays under 72 writes/day."""
+    result = simulate(PIGains(kp=SIM_KP, ti=SIM_TI))
+
+    print(  # noqa: T201
+        f"Kp={SIM_KP} Ti={SIM_TI}: {result.writes_per_day:.1f} writes/day, "
+        f"MAE {result.mean_abs_error:.3f} °C"
+    )
+    assert result.writes_per_day < WRITES_PER_DAY_LIMIT
