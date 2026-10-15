@@ -35,3 +35,8 @@ jobs:
 
       - name: Test
         run: ./run test
+
+      - name: Build the release archive
+        run: |
+          ./run archive
+          unzip -l dist/room_valve_control.zip | grep -q 'custom_components/room_valve_control/manifest.json'
