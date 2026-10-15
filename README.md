@@ -4,6 +4,8 @@ A Home Assistant custom component that controls radiator valves room by room. Ea
 
 Supported TRVs: Eurotronic Spirit Z-Wave Plus, through the Z-Wave JS integration.
 
+**Status:** under development. The current release only installs the integration; it does not create room entities or control valves yet. The plan is in [issue 1](https://github.com/mairas/room-valve-control/issues/1).
+
 ## Installation
 
 1. Download `room_valve_control.zip` from the [latest release](https://github.com/mairas/room-valve-control/releases/latest).
