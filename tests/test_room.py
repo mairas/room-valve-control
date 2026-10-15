@@ -594,6 +594,29 @@ async def test_failed_enter_direct_retry_is_not_logged(
     assert warnings(caplog) == []
 
 
+async def test_failed_reentry_after_external_change_warns_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A re-entry that fails is retried next step without a second warning."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    trv.mode = TrvMode.SELF_REGULATING
+    trv.sends = False
+
+    with caplog.at_level(logging.WARNING):
+        await room.step(at(15), fresh(20.0, at(15)))
+    assert len(warnings(caplog)) == 1
+    caplog.clear()
+    clear(trv)
+
+    with caplog.at_level(logging.WARNING):
+        await room.step(at(30), fresh(20.0, at(30)))
+
+    assert trv.calls[0] == ("direct",)
+    assert warnings(caplog) == []
+
+
 async def test_first_direct_step_integrates_one_control_step() -> None:
     """With no previous direct step the elapsed time is the control step."""
     room = make_room([FakeTrv(valve=0.0)])
