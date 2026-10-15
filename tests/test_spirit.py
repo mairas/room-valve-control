@@ -30,6 +30,13 @@ OFFSET_ID: Final = "number.living_room_trv_temperature_offset"
 CLIMATE_UNIQUE_ID: Final = f"{HOME_ID}.{NODE_ID}-64-0-mode"
 VALVE_UNIQUE_ID: Final = f"{HOME_ID}.{NODE_ID}-38-0-currentValue"
 OFFSET_UNIQUE_ID: Final = f"{HOME_ID}.{NODE_ID}-112-0-8"
+ADAPTER_SERVICES: Final = (
+    ("climate", "set_preset_mode"),
+    ("climate", "set_hvac_mode"),
+    ("climate", "set_temperature"),
+    ("number", "set_value"),
+    (ZWAVE_JS, "set_config_parameter"),
+)
 
 
 @dataclass
@@ -89,19 +96,23 @@ def set_climate(
     hass: HomeAssistant,
     state: str,
     preset: str = "none",
-    setpoint: float = 21.0,
+    setpoint: float | None = 21.0,
     current: float = 20.5,
+    **extra: object,
 ) -> None:
-    """Set the climate entity's state as zwave_js reports it."""
-    hass.states.async_set(
-        CLIMATE_ID,
-        state,
-        {
-            "preset_mode": preset,
-            "temperature": setpoint,
-            "current_temperature": current,
-        },
-    )
+    """
+    Set the climate entity's state as zwave_js reports it.
+
+    A setpoint of None leaves the temperature out, as in mode 31.
+    """
+    attributes: dict[str, object] = {
+        "preset_mode": preset,
+        "current_temperature": current,
+        **extra,
+    }
+    if setpoint is not None:
+        attributes["temperature"] = setpoint
+    hass.states.async_set(CLIMATE_ID, state, attributes)
 
 
 def record_service(
@@ -119,22 +130,14 @@ def record_service(
 def calls(hass: HomeAssistant) -> list[ServiceCall]:
     """Stub every service the adapter uses and record the calls in order."""
     recorded: list[ServiceCall] = []
-    for domain, service in (
-        ("climate", "set_preset_mode"),
-        ("climate", "set_hvac_mode"),
-        ("climate", "set_temperature"),
-        ("number", "set_value"),
-        (ZWAVE_JS, "set_config_parameter"),
-    ):
+    for domain, service in ADAPTER_SERVICES:
         record_service(hass, recorded, domain, service)
     return recorded
 
 
-async def test_resolves_valve_and_offset_entities(
-    hass: HomeAssistant, full_spirit: Spirit
-) -> None:
+@pytest.mark.usefixtures("full_spirit")
+async def test_resolves_valve_and_offset_entities(hass: HomeAssistant) -> None:
     """Both number entities are found on the climate entity's device."""
-    del full_spirit
     trv = SpiritTrv(hass, CLIMATE_ID)
 
     assert trv.valve_entity_id == VALVE_ID
@@ -217,9 +220,9 @@ async def test_disabled_climate_entity_fails(
     assert excinfo.value.disabled
 
 
-async def test_reads_device_state(hass: HomeAssistant, full_spirit: Spirit) -> None:
+@pytest.mark.usefixtures("full_spirit")
+async def test_reads_device_state(hass: HomeAssistant) -> None:
     """Setpoint, valve, offset and the TRV's own reading come from states."""
-    del full_spirit
     trv = SpiritTrv(hass, CLIMATE_ID)
 
     assert trv.available
@@ -231,36 +234,34 @@ async def test_reads_device_state(hass: HomeAssistant, full_spirit: Spirit) -> N
     assert trv.own_temperature == pytest.approx(21.7)
 
 
+@pytest.mark.usefixtures("full_spirit")
 async def test_mode_direct_with_preset_and_unknown_hvac_mode(
-    hass: HomeAssistant, full_spirit: Spirit
+    hass: HomeAssistant,
 ) -> None:
     """Mode 31 reads as direct although zwave_js has no hvac_mode for it."""
-    del full_spirit
     trv = SpiritTrv(hass, CLIMATE_ID)
-    set_climate(hass, STATE_UNKNOWN, preset=DIRECT_MODE_PRESET)
+    set_climate(hass, STATE_UNKNOWN, preset=DIRECT_MODE_PRESET, setpoint=None)
 
     assert trv.available
     assert trv.mode is TrvMode.DIRECT
 
 
-async def test_mode_unknown_for_other_states(
-    hass: HomeAssistant, full_spirit: Spirit
-) -> None:
+@pytest.mark.usefixtures("full_spirit")
+async def test_mode_unknown_for_other_states(hass: HomeAssistant) -> None:
     """Neither direct nor heat reads as unknown."""
-    del full_spirit
     trv = SpiritTrv(hass, CLIMATE_ID)
     set_climate(hass, "off")
 
     assert trv.mode is TrvMode.UNKNOWN
 
 
+@pytest.mark.usefixtures("full_spirit")
 async def test_enter_self_regulation_sets_mode_then_setpoint(
-    hass: HomeAssistant, full_spirit: Spirit, calls: list[ServiceCall]
+    hass: HomeAssistant, calls: list[ServiceCall]
 ) -> None:
     """Heat mode is written first; the setpoint write does nothing in mode 31."""
-    del full_spirit
     trv = SpiritTrv(hass, CLIMATE_ID)
-    set_climate(hass, STATE_UNKNOWN, preset=DIRECT_MODE_PRESET)
+    set_climate(hass, STATE_UNKNOWN, preset=DIRECT_MODE_PRESET, setpoint=None)
 
     sent = await trv.enter_self_regulation(19.5)
 
@@ -275,11 +276,11 @@ async def test_enter_self_regulation_sets_mode_then_setpoint(
     ]
 
 
+@pytest.mark.usefixtures("full_spirit")
 async def test_enter_self_regulation_skips_what_already_matches(
-    hass: HomeAssistant, full_spirit: Spirit, calls: list[ServiceCall]
+    hass: HomeAssistant, calls: list[ServiceCall]
 ) -> None:
     """Only the setpoint is written when the TRV already self-regulates."""
-    del full_spirit
     trv = SpiritTrv(hass, CLIMATE_ID)
 
     assert await trv.enter_self_regulation(21.0) == 0
@@ -287,11 +288,11 @@ async def test_enter_self_regulation_skips_what_already_matches(
     assert [c.service for c in calls] == ["set_temperature"]
 
 
+@pytest.mark.usefixtures("full_spirit")
 async def test_enter_direct_sets_manufacturer_preset(
-    hass: HomeAssistant, full_spirit: Spirit, calls: list[ServiceCall]
+    hass: HomeAssistant, calls: list[ServiceCall]
 ) -> None:
     """Direct mode is the Manufacturer specific preset."""
-    del full_spirit
     trv = SpiritTrv(hass, CLIMATE_ID)
 
     assert await trv.enter_direct()
@@ -304,11 +305,11 @@ async def test_enter_direct_sets_manufacturer_preset(
     ]
 
 
+@pytest.mark.usefixtures("full_spirit")
 async def test_set_valve_writes_number(
-    hass: HomeAssistant, full_spirit: Spirit, calls: list[ServiceCall]
+    hass: HomeAssistant, calls: list[ServiceCall]
 ) -> None:
     """The valve position goes to the valve number entity."""
-    del full_spirit
     trv = SpiritTrv(hass, CLIMATE_ID)
 
     assert await trv.set_valve(63)
@@ -317,19 +318,18 @@ async def test_set_valve_writes_number(
     ]
 
 
+@pytest.mark.usefixtures("full_spirit")
 @pytest.mark.parametrize(
     ("offset", "tenths"),
     [(7.0, 50), (-7.0, -50), (-0.26, -3), (1.04, 10), (0.0, 0)],
 )
 async def test_set_offset_clamps_and_rounds(
     hass: HomeAssistant,
-    full_spirit: Spirit,
     calls: list[ServiceCall],
     offset: float,
     tenths: int,
 ) -> None:
     """Offsets are written as parameter 8 in tenths, within ±5.0 °C."""
-    del full_spirit
     trv = SpiritTrv(hass, CLIMATE_ID)
 
     assert await trv.set_offset(offset)
@@ -342,11 +342,11 @@ async def test_set_offset_clamps_and_rounds(
     ]
 
 
+@pytest.mark.usefixtures("full_spirit")
 async def test_unavailable_trv_sends_nothing(
-    hass: HomeAssistant, full_spirit: Spirit, calls: list[ServiceCall]
+    hass: HomeAssistant, calls: list[ServiceCall]
 ) -> None:
     """An unavailable climate entity reports so and no write is sent."""
-    del full_spirit
     trv = SpiritTrv(hass, CLIMATE_ID)
     hass.states.async_set(CLIMATE_ID, STATE_UNAVAILABLE)
 
@@ -359,11 +359,9 @@ async def test_unavailable_trv_sends_nothing(
     assert calls == []
 
 
-async def test_unreadable_values_read_as_none(
-    hass: HomeAssistant, full_spirit: Spirit
-) -> None:
+@pytest.mark.usefixtures("full_spirit")
+async def test_unreadable_values_read_as_none(hass: HomeAssistant) -> None:
     """Unavailable number entities give no valve, offset or own reading."""
-    del full_spirit
     trv = SpiritTrv(hass, CLIMATE_ID)
     hass.states.async_set(VALVE_ID, STATE_UNAVAILABLE)
     hass.states.async_set(OFFSET_ID, STATE_UNKNOWN)
@@ -373,28 +371,21 @@ async def test_unreadable_values_read_as_none(
     assert trv.own_temperature is None
 
 
+@pytest.mark.usefixtures("full_spirit")
 async def test_failed_service_reports_not_sent(
     hass: HomeAssistant,
-    full_spirit: Spirit,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A service error is logged and reported, never raised."""
-    del full_spirit
 
     async def fail(call: ServiceCall) -> None:
         msg = f"{call.service} failed"
         raise HomeAssistantError(msg)
 
-    for domain, service in (
-        ("climate", "set_preset_mode"),
-        ("climate", "set_hvac_mode"),
-        ("climate", "set_temperature"),
-        ("number", "set_value"),
-        (ZWAVE_JS, "set_config_parameter"),
-    ):
+    for domain, service in ADAPTER_SERVICES:
         hass.services.async_register(domain, service, fail)
     trv = SpiritTrv(hass, CLIMATE_ID)
-    set_climate(hass, STATE_UNKNOWN, preset=DIRECT_MODE_PRESET)
+    set_climate(hass, STATE_UNKNOWN, preset=DIRECT_MODE_PRESET, setpoint=None)
 
     assert not await trv.enter_direct()
     assert await trv.enter_self_regulation(20.0) == 0
