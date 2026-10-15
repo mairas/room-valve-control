@@ -1,7 +1,7 @@
 """Constants for the Room Valve Control integration."""
 
 from datetime import timedelta
-from typing import Final
+from typing import Final, TypedDict
 
 DOMAIN: Final = "room_valve_control"
 
@@ -19,6 +19,26 @@ CONF_MIN_CHANGE: Final = "min_change"
 CONF_STALE_TIMEOUT: Final = "stale_timeout"
 CONF_MIN_TARGET: Final = "min_target"
 CONF_MAX_TARGET: Final = "max_target"
+
+
+class RoomParameters(TypedDict):
+    """A room's controller parameters, keyed by the CONF_ constants above."""
+
+    kp: float
+    ti: float
+    control_step: float
+    min_change: float
+    stale_timeout: float
+    min_target: float
+    max_target: float
+
+
+class RoomConfig(RoomParameters):
+    """A room subentry's data."""
+
+    sensors: list[str]
+    trvs: list[str]
+
 
 # A 12 min integral time over-integrates at a 15 min step (81 simulated
 # writes/day); 30 min tracks best within the write budget. The stale timeout sits
