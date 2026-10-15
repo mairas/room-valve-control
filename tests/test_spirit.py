@@ -98,12 +98,14 @@ def full_spirit(hass: HomeAssistant, spirit_device: Spirit) -> Spirit:
     return spirit_device
 
 
-def set_climate(
+def set_climate(  # noqa: PLR0913
     hass: HomeAssistant,
     state: str,
+    *,
     preset: str = "none",
     setpoint: float | None = 21.0,
     step: float | None = None,
+    current: float = CURRENT_TEMPERATURE,
 ) -> None:
     """
     Set the climate entity's state as zwave_js reports it.
@@ -112,7 +114,7 @@ def set_climate(
     """
     attributes: dict[str, object] = {
         "preset_mode": preset,
-        "current_temperature": CURRENT_TEMPERATURE,
+        "current_temperature": current,
     }
     if step is not None:
         attributes["target_temp_step"] = step
@@ -658,10 +660,16 @@ async def test_set_valve_needs_valve_entity_state(
 
 
 @pytest.mark.usefixtures("full_spirit")
-async def test_own_temperature_waits_for_report_after_offset_write(
+async def test_own_temperature_waits_for_changed_report_after_offset_write(
     hass: HomeAssistant, calls: list[ServiceCall], freezer: FrozenDateTimeFactory
 ) -> None:
-    """The reported temperature includes a new offset only once re-reported."""
+    """
+    The reported temperature includes a new offset only once it changes.
+
+    Moving the offset from -1.2 to +0.5 °C moves the report by 1.7 °C. A climate
+    state write that changes only the mode, or that is not later than the
+    offset write, is not that report.
+    """
     trv = SpiritTrv(hass, CLIMATE_ID)
     assert trv.own_temperature is not None
 
@@ -671,9 +679,38 @@ async def test_own_temperature_waits_for_report_after_offset_write(
     hass.states.async_set(OFFSET_ID, "5.0")
     assert trv.own_temperature is None
 
+    set_climate(hass, "heat", current=CURRENT_TEMPERATURE + 1.7)
+    assert trv.own_temperature is None
+
+    freezer.tick(1)
+    set_climate(hass, STATE_UNKNOWN, preset=DIRECT_MODE_PRESET, setpoint=None)
+    assert trv.own_temperature is None
+
+    freezer.tick(1)
+    set_climate(hass, "heat", current=CURRENT_TEMPERATURE + 1.7)
+    assert trv.own_temperature == pytest.approx(CURRENT_TEMPERATURE + 1.2)
+
+    # Once open, the gate stays open when the room returns to the old reading.
     freezer.tick(1)
     set_climate(hass, "heat")
     assert trv.own_temperature == pytest.approx(CURRENT_TEMPERATURE - 0.5)
+
+
+@pytest.mark.usefixtures("full_spirit")
+@pytest.mark.parametrize("offset", [-1.2, -1.24])
+async def test_offset_write_without_change_sends_nothing(
+    hass: HomeAssistant,
+    calls: list[ServiceCall],
+    freezer: FrozenDateTimeFactory,
+    offset: float,
+) -> None:
+    """An offset already applied, in tenths, is not written and keeps readings."""
+    trv = SpiritTrv(hass, CLIMATE_ID)
+
+    freezer.tick(1)
+    assert not await trv.set_offset(offset)
+    assert calls == []
+    assert trv.own_temperature == pytest.approx(CURRENT_TEMPERATURE + 1.2)
 
 
 async def test_reads_follow_renames_while_loaded(

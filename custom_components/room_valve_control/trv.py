@@ -86,5 +86,9 @@ class Trv(Protocol):
         ...
 
     async def set_offset(self, offset: float) -> bool:
-        """Write the temperature offset in °C; return whether it was sent."""
+        """
+        Write the temperature offset in °C; return whether it was sent.
+
+        An offset the device already applies, at its resolution, is not sent.
+        """
         ...

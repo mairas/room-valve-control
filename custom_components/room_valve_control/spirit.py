@@ -163,7 +163,9 @@ class SpiritTrv:
         """Find the TRV's entities; raise SpiritEntityError if one is unusable."""
         self._hass = hass
         self._setpoint_pending = False
+        # When the last offset write went out, and the temperature then reported.
         self._offset_written_at: datetime | None = None
+        self._temperature_at_offset_write: float | None = None
         registry = er.async_get(hass)
         climate = _usable(
             SpiritEntity.CLIMATE,
@@ -289,17 +291,24 @@ class SpiritTrv:
         """
         Return the TRV's reading without its offset.
 
-        None until the climate entity reports again after an offset write: the
-        Spirit re-reports its temperature, which includes the offset, only
-        minutes later. Any climate state write counts as a report.
+        None after an offset write until the climate entity reports, later than
+        the write, a temperature other than the one it reported at the write:
+        the Spirit re-reports its temperature, which includes the offset, only
+        minutes later. Every offset write changes the applied tenths, so it
+        always moves the report.
         """
         state = self._hass.states.get(self.climate_entity_id)
-        if state is None or (
-            self._offset_written_at is not None
-            and state.last_reported <= self._offset_written_at
-        ):
+        if state is None:
             return None
         reported = self._climate_attribute(ATTR_CURRENT_TEMPERATURE)
+        if self._offset_written_at is not None:
+            if (
+                state.last_reported <= self._offset_written_at
+                or reported == self._temperature_at_offset_write
+            ):
+                return None
+            # Open for good, so a later return to the old reading is not gated.
+            self._offset_written_at = None
         offset = self.offset
         if reported is None or offset is None:
             return None
@@ -395,18 +404,29 @@ class SpiritTrv:
         )
 
     async def set_offset(self, offset: float) -> bool:
-        """Write parameter 8, clamped to ±5.0 °C in 0.1 °C steps."""
+        """
+        Write parameter 8, clamped to ±5.0 °C in 0.1 °C steps.
+
+        Sends nothing when parameter 8 already reads the same tenths, so a
+        write that would not move the reported temperature never gates it.
+        """
+        tenths = offset_to_tenths(offset)
+        current = self._number_state(self.offset_entity_id)
+        if current is not None and round(current) == tenths:
+            return False
+        temperature = self._climate_attribute(ATTR_CURRENT_TEMPERATURE)
         sent = await self._call(
             ZWAVE_JS_DOMAIN,
             SERVICE_SET_CONFIG_PARAMETER,
             {
                 ATTR_ENTITY_ID: self.climate_entity_id,
                 ATTR_CONFIG_PARAMETER: OFFSET_PARAMETER,
-                ATTR_CONFIG_VALUE: offset_to_tenths(offset),
+                ATTR_CONFIG_VALUE: tenths,
             },
         )
         if sent:
             self._offset_written_at = dt_util.utcnow()
+            self._temperature_at_offset_write = temperature
         return sent
 
     def _climate_attribute(self, attribute: str) -> float | None:
