@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Final
 import pytest
 from homeassistant.config_entries import RELOAD_AFTER_UPDATE_DELAY, ConfigEntryState
 from homeassistant.const import (
+    ATTR_ENTITY_ID,
     ATTR_TEMPERATURE,
     EVENT_HOMEASSISTANT_STOP,
     STATE_UNKNOWN,
@@ -23,6 +24,7 @@ from custom_components.room_valve_control.const import (
     DEFAULT_STALE_TIMEOUT,
     DOMAIN,
 )
+from custom_components.room_valve_control.room import ControlMode
 from custom_components.room_valve_control.spirit import DIRECT_MODE_PRESET
 
 from .live_room import (
@@ -36,6 +38,7 @@ from .live_room import (
     async_set_room_target,
     async_setup_room,
     async_setup_spirits,
+    async_wait_for,
     register_sensor,
     registry_ids,
 )
@@ -56,6 +59,8 @@ OTHER_SENSOR: Final = "sensor.living_room_window_temperature"
 RENAMED_CLIMATE: Final = "climate.lounge"
 INTEGRATOR_SENSOR: Final = "sensor.living_room_integrator"
 MODE_SENSOR: Final = "sensor.living_room_control_mode"
+# Seconds the Core stop hand back may take in a test; the writes take far less.
+HAND_BACK_BOUND: Final = 0.1
 STEPS_IN_STARTUP_GRACE: Final = DEFAULT_STALE_TIMEOUT // DEFAULT_CONTROL_STEP - 1
 
 
@@ -90,11 +95,11 @@ async def test_setup_and_unload_entry(hass: HomeAssistant) -> None:
     entry.add_to_hass(hass)
 
     assert await hass.config_entries.async_setup(entry.entry_id)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert entry.state is ConfigEntryState.LOADED
 
     assert await hass.config_entries.async_unload(entry.entry_id)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert entry.state is ConfigEntryState.NOT_LOADED
 
 
@@ -140,7 +145,7 @@ async def test_fresh_reading_steps_at_once(
     assert calls == []
 
     hass.states.async_set(WALL_SENSOR, READING)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
 
     assert calls == entering_direct()
 
@@ -155,7 +160,7 @@ async def test_reading_change_in_direct_waits_for_next_step(
     calls.clear()
 
     hass.states.async_set(WALL_SENSOR, "19.5")
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert calls == []
 
     await async_advance(hass, freezer)
@@ -178,7 +183,7 @@ async def test_unchanged_value_reported_after_fallback_steps_back_to_direct(
     assert reported_before is not None
 
     hass.states.async_set(WALL_SENSOR, READING)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
 
     reported = hass.states.get(WALL_SENSOR)
     assert reported is not None
@@ -204,7 +209,7 @@ async def test_unload_hands_back_every_trv(
     calls.clear()
 
     assert await hass.config_entries.async_unload(entry.entry_id)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
 
     assert calls == handing_back()
 
@@ -231,28 +236,115 @@ async def test_stop_hands_back_before_the_stop_event(
 
 
 @pytest.mark.usefixtures("zwave_js_flow")
-async def test_hand_back_is_bounded(
+async def test_stop_hand_back_is_bounded(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A TRV that never answers is cut off at the hand back timeout."""
+    """At Core stop a TRV that never answers is cut off at the hand back bound."""
+    calls: list[TrvCall] = []
+    trvs = await async_setup_spirits(hass, calls)
+    hass.states.async_set(WALL_SENSOR, READING)
+    await async_setup_room(hass)
+    await async_set_room_target(hass, TARGET)
+    stall = asyncio.Event()
+    trvs[0].stall = stall
+    monkeypatch.setattr(runtime, "HAND_BACK_TIMEOUT", HAND_BACK_BOUND)
+
+    @callback
+    def stop_event(_event: Event) -> None:
+        stall.set()
+
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, stop_event)
+
+    with caplog.at_level(logging.WARNING):
+        await hass.async_stop()
+
+    assert ("set_hvac_mode", TRVS[0].climate, "heat") in calls
+    assert "cut off" in caplog.text
+
+
+async def _async_stall_the_first_step(
+    hass: HomeAssistant, calls: list[TrvCall]
+) -> None:
+    """
+    Set the target and wait until its step reaches the second TRV's valve.
+
+    Time is not frozen here: a frozen clock would never end the hand back bound.
+    """
+    await hass.services.async_call(
+        "climate",
+        "set_temperature",
+        {ATTR_ENTITY_ID: ROOM_CLIMATE, ATTR_TEMPERATURE: TARGET},
+        blocking=True,
+    )
+    await async_wait_for(lambda: ("set_value", TRVS[1].valve, OUTPUT) in calls)
+    calls.clear()
+
+
+@pytest.mark.usefixtures("zwave_js_flow")
+async def test_stop_hands_back_past_a_stalled_step(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Core stop cancels a step stalled on a TRV and still stops the room."""
+    calls: list[TrvCall] = []
+    trvs = await async_setup_spirits(hass, calls)
+    hass.states.async_set(WALL_SENSOR, READING)
+    await async_setup_room(hass)
+    stall = asyncio.Event()
+    trvs[1].stall_valve = stall
+    trvs[1].stall = stall
+    await _async_stall_the_first_step(hass, calls)
+    monkeypatch.setattr(runtime, "HAND_BACK_TIMEOUT", HAND_BACK_BOUND)
+    at_stop_event: list[TrvCall] = []
+    mode_at_stop_event: list[str] = []
+
+    @callback
+    def stop_event(_event: Event) -> None:
+        at_stop_event.extend(calls)
+        mode = hass.states.get(MODE_SENSOR)
+        assert mode is not None
+        mode_at_stop_event.append(mode.state)
+        stall.set()
+
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, stop_event)
+
+    await hass.async_stop()
+
+    assert mode_at_stop_event == ["stopped"]
+    # The healthy TRV is handed back; the stalled one is cut off in heat mode.
+    assert sorted(at_stop_event) == sorted(
+        [
+            ("set_hvac_mode", TRVS[0].climate, "heat"),
+            ("set_temperature", TRVS[0].climate, TARGET),
+            ("set_hvac_mode", TRVS[1].climate, "heat"),
+        ]
+    )
+
+
+@pytest.mark.usefixtures("zwave_js_flow")
+async def test_unload_hands_back_past_a_stalled_step(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unload cancels a stalled step and hands every TRV back, with no deadline."""
     calls: list[TrvCall] = []
     trvs = await async_setup_spirits(hass, calls)
     hass.states.async_set(WALL_SENSOR, READING)
     entry = await async_setup_room(hass)
-    await async_set_room_target(hass, TARGET)
     stall = asyncio.Event()
-    trvs[0].stall = stall
-    monkeypatch.setattr(runtime, "HAND_BACK_TIMEOUT", 0.01)
+    trvs[1].stall_valve = stall
+    await _async_stall_the_first_step(hass, calls)
+    room = entry.runtime_data[ROOM_ID].room
+    assert room is not None
+    # Any deadline on the unload's hand back would cut it off at once.
+    monkeypatch.setattr(runtime, "HAND_BACK_TIMEOUT", 0.0)
 
-    with caplog.at_level(logging.WARNING):
-        assert await hass.config_entries.async_unload(entry.entry_id)
+    assert await hass.config_entries.async_unload(entry.entry_id)
 
-    assert ("set_hvac_mode", TRVS[0].climate, "heat") in calls
-    assert "cut off" in caplog.text
+    assert room.control_mode is ControlMode.STOPPED
+    assert sorted(calls) == sorted(handing_back())
     stall.set()
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
 
 
 @pytest.mark.usefixtures("zwave_js_flow")
@@ -261,7 +353,7 @@ async def test_removed_trv_leaves_the_entry_not_ready(hass: HomeAssistant) -> No
     await async_setup_spirits(hass, [])
     stored = registry_ids(hass, [ids.climate for ids in TRVS])
     er.async_get(hass).async_remove(TRVS[1].climate)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
 
     entry = await async_setup_room(hass, trvs=stored)
 
@@ -329,7 +421,7 @@ async def test_climate_entity_going_away_hands_back(
         )
     else:
         registry.async_remove(ROOM_CLIMATE)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert hass.states.get(ROOM_CLIMATE) is None
     assert calls == handing_back()
 
@@ -352,7 +444,7 @@ async def test_reload_hands_back_once(
     hass.config_entries.async_update_subentry(
         entry, subentry, data={**subentry.data, CONF_KP: 40.0}
     )
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
 
     handed_back = handing_back()
     assert calls[: len(handed_back)] == handed_back
@@ -377,9 +469,9 @@ async def test_reload_does_not_integrate_a_step(
     hass.config_entries.async_update_subentry(
         entry, subentry, data={**subentry.data, CONF_KP: 40.0}
     )
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     hass.states.async_set(WALL_SENSOR, READING, force_update=True)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
 
     mode = hass.states.get(MODE_SENSOR)
     integrator = hass.states.get(INTEGRATOR_SENSOR)
@@ -399,7 +491,7 @@ async def test_renamed_climate_entity_keeps_the_room_running(
     calls.clear()
 
     er.async_get(hass).async_update_entity(ROOM_CLIMATE, new_entity_id=RENAMED_CLIMATE)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     renamed = hass.states.get(RENAMED_CLIMATE)
     hass.states.async_set(WALL_SENSOR, "19.5")
     await async_advance(hass, freezer)

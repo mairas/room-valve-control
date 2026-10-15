@@ -1,5 +1,6 @@
 """A room entry over live fake Spirit TRVs that apply and record their writes."""
 
+import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, override
 
@@ -43,8 +44,7 @@ from .helpers import (
 )
 
 if TYPE_CHECKING:
-    import asyncio
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
     from datetime import timedelta
 
     from freezegun.api import FrozenDateTimeFactory
@@ -60,6 +60,8 @@ WALL_SENSOR: Final = "sensor.living_room_temperature"
 TRV_OWN_TEMPERATURE: Final = 20.5
 OFFSET_TENTHS_PER_DEGREE: Final = 10
 TRV_SETPOINT: Final = 21.0
+# Event loop iterations async_wait_for allows; far more than any write needs.
+WAIT_ITERATIONS: Final = 1000
 
 # (service, entity id, value) of a write that reached a TRV.
 type TrvCall = tuple[str, str, object]
@@ -104,6 +106,8 @@ class FakeSpiritClimate(ClimateEntity):
         self._calls = calls
         # While set, heat mode writes hang until it is.
         self.stall: asyncio.Event | None = None
+        # While set, writes to the valve number hang until it is.
+        self.stall_valve: asyncio.Event | None = None
         self.entity_id = ids.climate
         self._attr_unique_id = value_unique_id(
             ids.node_id, COMMAND_CLASS_THERMOSTAT_MODE, "mode"
@@ -179,10 +183,11 @@ async def async_setup_spirits(
     zwave_entry = MockConfigEntry(domain=ZWAVE_JS)
     zwave_entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(zwave_entry.entry_id)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
 
     devices = dr.async_get(hass)
     offsets = {}
+    by_valve = {ids.valve: entity for ids, entity in zip(TRVS, entities, strict=True)}
     for ids in TRVS:
         device = devices.async_get_device_by_identifier(
             (ZWAVE_JS, f"{HOME_ID}-{ids.node_id}"), zwave_entry.entry_id
@@ -198,6 +203,9 @@ async def async_setup_spirits(
     async def set_value(call: ServiceCall) -> None:
         entity_id = call.data[ATTR_ENTITY_ID]
         calls.append(("set_value", entity_id, call.data["value"]))
+        trv = by_valve.get(entity_id)
+        if trv is not None and trv.stall_valve is not None:
+            await trv.stall_valve.wait()
         hass.states.async_set(entity_id, str(float(call.data["value"])))
 
     async def set_config_parameter(call: ServiceCall) -> None:
@@ -261,7 +269,7 @@ async def async_setup_room(
     )
     entry.add_to_hass(hass)
     await hass.config_entries.async_setup(entry.entry_id)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     return entry
 
 
@@ -273,7 +281,7 @@ async def async_set_room_target(hass: HomeAssistant, target: float) -> None:
         {ATTR_ENTITY_ID: ROOM_CLIMATE, ATTR_TEMPERATURE: target},
         blocking=True,
     )
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
 
 
 async def async_advance(
@@ -284,4 +292,14 @@ async def async_advance(
     """Move time on by duration and run what came due."""
     freezer.tick(duration)
     async_fire_time_changed(hass)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+
+async def async_wait_for(condition: Callable[[], bool]) -> None:
+    """Run the event loop until condition holds, without waiting on stalled tasks."""
+    for _ in range(WAIT_ITERATIONS):
+        if condition():
+            return
+        await asyncio.sleep(0)
+    msg = "condition never held"
+    raise AssertionError(msg)

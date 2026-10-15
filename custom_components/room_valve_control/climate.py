@@ -9,8 +9,6 @@ from homeassistant.components.climate.const import ClimateEntityFeature, HVACMod
 from homeassistant.const import ATTR_TEMPERATURE, PRECISION_TENTHS, UnitOfTemperature
 from homeassistant.helpers.restore_state import ExtraStoredData, RestoreEntity
 
-from .runtime import async_hand_back_all
-
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
@@ -143,7 +141,7 @@ class RoomClimate(ClimateEntity, RestoreEntity):
             and entry.entity_id != self.entity_id
         )
         if not renamed:
-            await async_hand_back_all((self._runtime,))
+            await self._runtime.async_hand_back()
         await super().async_will_remove_from_hass()
 
     @override
