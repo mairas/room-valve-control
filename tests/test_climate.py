@@ -19,6 +19,7 @@ from pytest_homeassistant_custom_component.common import (
     mock_restore_cache_with_extra_data,
 )
 
+from custom_components.room_valve_control.climate import TARGET_TEMPERATURE_STEP
 from custom_components.room_valve_control.const import (
     DEFAULT_MAX_TARGET,
     DEFAULT_MIN_TARGET,
@@ -49,6 +50,7 @@ RESTORED_WRITES: Final = 7
 MODE_SENSOR: Final = "sensor.living_room_control_mode"
 BELOW_TARGET: Final = "20.0"
 LATER_READING: Final = "20.4"
+NEXT_TARGET: Final = 21.3
 
 
 def restore(hass: HomeAssistant, extra: dict[str, Any]) -> None:
@@ -63,17 +65,17 @@ async def test_thermostat_is_heat_only_on_the_room_device(
 ) -> None:
     """The thermostat sits on a device named after the room."""
     await async_setup_room(hass)
-    hass.states.async_set(WALL_SENSOR, "20.3")
+    hass.states.async_set(WALL_SENSOR, LATER_READING)
 
     state = hass.states.get(ROOM_CLIMATE)
     assert state is not None
     assert state.state == HVACMode.HEAT
     assert state.attributes[ATTR_HVAC_MODES] == [HVACMode.HEAT]
-    assert state.attributes[ATTR_CURRENT_TEMPERATURE] == 20.3  # noqa: PLR2004
+    assert state.attributes[ATTR_CURRENT_TEMPERATURE] == float(LATER_READING)
     assert state.attributes[ATTR_TEMPERATURE] is None
     assert state.attributes[ATTR_MIN_TEMP] == DEFAULT_MIN_TARGET
     assert state.attributes[ATTR_MAX_TEMP] == DEFAULT_MAX_TARGET
-    assert state.attributes[ATTR_TARGET_TEMP_STEP] == 0.1  # noqa: PLR2004
+    assert state.attributes[ATTR_TARGET_TEMP_STEP] == TARGET_TEMPERATURE_STEP
     device = dr.async_get(hass).async_get_device_by_identifier(
         (DOMAIN, ROOM_ID), hass.config_entries.async_entries(DOMAIN)[0].entry_id
     )
@@ -87,7 +89,7 @@ async def test_target_is_echoed_and_first_target_steps_at_once(
 ) -> None:
     """The first target acts at once; later ones wait for the step in direct."""
     await async_setup_room(hass)
-    hass.states.async_set(WALL_SENSOR, "20.0")
+    hass.states.async_set(WALL_SENSOR, BELOW_TARGET)
 
     await async_set_room_target(hass, RESTORED_TARGET)
 
@@ -97,11 +99,11 @@ async def test_target_is_echoed_and_first_target_steps_at_once(
     assert {call[1] for call in calls} >= {ids.valve for ids in TRVS}
     calls.clear()
 
-    await async_set_room_target(hass, 21.3)
+    await async_set_room_target(hass, NEXT_TARGET)
 
     state = hass.states.get(ROOM_CLIMATE)
     assert state is not None
-    assert state.attributes[ATTR_TEMPERATURE] == 21.3  # noqa: PLR2004
+    assert state.attributes[ATTR_TEMPERATURE] == NEXT_TARGET
     assert calls == []
 
 
@@ -209,7 +211,7 @@ async def test_stored_state_round_trips(
 ) -> None:
     """What the thermostat stores is what the steps left behind."""
     await async_setup_room(hass)
-    hass.states.async_set(WALL_SENSOR, "20.0")
+    hass.states.async_set(WALL_SENSOR, BELOW_TARGET)
     await async_set_room_target(hass, RESTORED_TARGET)
     await async_advance(hass, freezer)
 
