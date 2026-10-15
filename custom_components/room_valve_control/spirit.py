@@ -1,5 +1,6 @@
 """Eurotronic Spirit Z-Wave Plus TRV over Home Assistant's zwave_js entities."""
 
+import asyncio
 import logging
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final
@@ -9,6 +10,8 @@ from homeassistant.components.climate.const import (
     ATTR_CURRENT_TEMPERATURE,
     ATTR_HVAC_MODE,
     ATTR_PRESET_MODE,
+    ATTR_TARGET_TEMP_STEP,
+    PRESET_NONE,
     SERVICE_SET_HVAC_MODE,
     SERVICE_SET_PRESET_MODE,
     SERVICE_SET_TEMPERATURE,
@@ -18,8 +21,10 @@ from homeassistant.components.climate.const import DOMAIN as CLIMATE_DOMAIN
 from homeassistant.components.number.const import ATTR_VALUE, SERVICE_SET_VALUE
 from homeassistant.components.number.const import DOMAIN as NUMBER_DOMAIN
 from homeassistant.const import ATTR_ENTITY_ID, ATTR_TEMPERATURE, STATE_UNAVAILABLE
+from homeassistant.core import Event, EventStateChangedData, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.event import async_track_state_change_event
 
 from .trv import TrvMode
 
@@ -47,6 +52,13 @@ _VALUE_ID_PARTS: Final = 4
 # reports no hvac_mode while it is active.
 DIRECT_MODE_PRESET: Final = "Manufacturer specific"
 SELF_REGULATION_HVAC_MODE: Final = HVACMode.HEAT
+
+# zwave_js picks the setpoint to write from the mode it last read, so a setpoint
+# written before heat mode reads back lands nowhere. Seconds.
+MODE_CHANGE_TIMEOUT: Final = 10.0
+
+# zwave_js reports no target_temp_step for the Spirit; its setpoint is in 0.5 °C.
+DEFAULT_SETPOINT_STEP: Final = 0.5
 
 # Parameter 8 is in tenths of a °C, -50…50.
 OFFSET_TENTHS_PER_DEGREE: Final = 10
@@ -127,6 +139,7 @@ class SpiritTrv:
     def __init__(self, hass: HomeAssistant, climate_entity_id: str) -> None:
         """Find the TRV's entities; raise SpiritEntityError if one is unusable."""
         self._hass = hass
+        self._setpoint_pending = False
         registry = er.async_get(hass)
         climate = _usable(
             SpiritEntity.CLIMATE,
@@ -164,13 +177,15 @@ class SpiritTrv:
 
     @property
     def mode(self) -> TrvMode:
-        """Return direct in mode 31, self-regulating in heat, else unknown."""
+        """Return direct in mode 31, self-regulating in plain heat, else unknown."""
         state = self._hass.states.get(self.climate_entity_id)
         if state is None or state.state == STATE_UNAVAILABLE:
             return TrvMode.UNKNOWN
-        if state.attributes.get(ATTR_PRESET_MODE) == DIRECT_MODE_PRESET:
+        preset = state.attributes.get(ATTR_PRESET_MODE)
+        if preset == DIRECT_MODE_PRESET:
             return TrvMode.DIRECT
-        if state.state == SELF_REGULATION_HVAC_MODE:
+        # Energy heat and Full power are presets that also read as heat.
+        if state.state == SELF_REGULATION_HVAC_MODE and preset in (None, PRESET_NONE):
             return TrvMode.SELF_REGULATING
         return TrvMode.UNKNOWN
 
@@ -211,10 +226,16 @@ class SpiritTrv:
         )
 
     async def enter_self_regulation(self, setpoint: float) -> int:
-        """Set heat mode, then the setpoint, skipping what already matches."""
+        """
+        Set heat mode, then the setpoint, skipping what already matches.
+
+        After a mode change the setpoint is written only once heat mode reads
+        back, and then without comparing: the reported setpoint is the one
+        from before. If heat mode does not read back in time, the setpoint is
+        left to the next call.
+        """
         sent = 0
         if self.mode is not TrvMode.SELF_REGULATING:
-            # The setpoint write is a no-op until the TRV has left mode 31.
             if not await self._call(
                 CLIMATE_DOMAIN,
                 SERVICE_SET_HVAC_MODE,
@@ -225,13 +246,51 @@ class SpiritTrv:
             ):
                 return sent
             sent += 1
-        if self.setpoint != setpoint and await self._call(
+            self._setpoint_pending = True
+            if not await self._wait_for_self_regulation():
+                _LOGGER.info(
+                    "%s: heat mode not reported within %s s; setpoint deferred",
+                    self.climate_entity_id,
+                    MODE_CHANGE_TIMEOUT,
+                )
+                return sent
+        if (
+            self._setpoint_pending or not self._setpoint_matches(setpoint)
+        ) and await self._call(
             CLIMATE_DOMAIN,
             SERVICE_SET_TEMPERATURE,
             {ATTR_ENTITY_ID: self.climate_entity_id, ATTR_TEMPERATURE: setpoint},
         ):
+            self._setpoint_pending = False
             sent += 1
         return sent
+
+    def _setpoint_matches(self, setpoint: float) -> bool:
+        reported = self.setpoint
+        step = self._climate_attribute(ATTR_TARGET_TEMP_STEP) or DEFAULT_SETPOINT_STEP
+        return reported is not None and abs(reported - setpoint) < step / 2
+
+    async def _wait_for_self_regulation(self) -> bool:
+        if self.mode is TrvMode.SELF_REGULATING:
+            return True
+        switched = asyncio.Event()
+
+        @callback
+        def _state_changed(_event: Event[EventStateChangedData]) -> None:
+            if self.mode is TrvMode.SELF_REGULATING:
+                switched.set()
+
+        unsubscribe = async_track_state_change_event(
+            self._hass, self.climate_entity_id, _state_changed
+        )
+        try:
+            async with asyncio.timeout(MODE_CHANGE_TIMEOUT):
+                await switched.wait()
+        except TimeoutError:
+            return False
+        finally:
+            unsubscribe()
+        return True
 
     async def set_valve(self, percent: int) -> bool:
         """Write the valve number."""
