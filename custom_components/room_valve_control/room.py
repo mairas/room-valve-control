@@ -198,7 +198,9 @@ class Room:
     async def _update_offset(self, trv: Trv, reading: float) -> None:
         if trv.own_temperature is None:
             return
-        wanted = reading - trv.own_temperature
+        # Compared clamped: the readback can never exceed the device limit.
+        limit = trv.max_offset
+        wanted = max(-limit, min(limit, reading - trv.own_temperature))
         if trv.offset is None or abs(wanted - trv.offset) >= OFFSET_MIN_CHANGE:
             self._device_writes += await trv.set_offset(wanted)
 
