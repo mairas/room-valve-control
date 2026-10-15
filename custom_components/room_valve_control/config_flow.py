@@ -1,5 +1,6 @@
 """Config flow for the Room Valve Control integration, one subentry per room."""
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, override
 
@@ -161,8 +162,8 @@ def _parse(user_input: Mapping[str, Any]) -> _RoomForm:
 
     return _RoomForm(
         name=user_input[CONF_NAME],
-        sensors=user_input[CONF_SENSORS],
-        trvs=user_input[CONF_TRVS],
+        sensors=list(dict.fromkeys(user_input[CONF_SENSORS])),
+        trvs=list(dict.fromkeys(user_input[CONF_TRVS])),
         parameters={
             CONF_KP: user_input[CONF_KP],
             CONF_TI: seconds(CONF_TI),
@@ -176,15 +177,22 @@ def _parse(user_input: Mapping[str, Any]) -> _RoomForm:
 
 
 def _parameter_errors(parameters: RoomParameters) -> dict[str, str]:
-    errors: dict[str, str] = {}
-    positive = {
+    numbers = {
         CONF_KP: parameters[CONF_KP],
         CONF_TI: parameters[CONF_TI],
         CONF_CONTROL_STEP: parameters[CONF_CONTROL_STEP],
+        CONF_MIN_CHANGE: parameters[CONF_MIN_CHANGE],
         CONF_STALE_TIMEOUT: parameters[CONF_STALE_TIMEOUT],
+        CONF_MIN_TARGET: parameters[CONF_MIN_TARGET],
+        CONF_MAX_TARGET: parameters[CONF_MAX_TARGET],
     }
-    for key, value in positive.items():
-        if value <= 0:
+    # Every comparison with NaN is false, so it would pass the checks below.
+    if errors := {
+        key: "not_finite" for key, value in numbers.items() if not math.isfinite(value)
+    }:
+        return errors
+    for key in (CONF_KP, *DURATION_FIELDS):
+        if numbers[key] <= 0:
             errors[key] = "not_positive"
     # At or below the endpoint tolerance a valve near 0 or 99 would never be
     # driven to the endpoint while a mid-range move of the same size would be.

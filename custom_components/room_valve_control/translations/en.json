@@ -79,6 +79,7 @@
         "trv_entity_disabled": "{trv} is not usable: its {entity} entity {entity_id} is disabled. Enable it and try again.",
         "trv_no_device": "{trv} is not usable: it belongs to no device. Only Eurotronic Spirit TRVs on Z-Wave JS are supported.",
         "not_positive": "Must be greater than zero.",
+        "not_finite": "Must be a finite number.",
         "min_change_out_of_range": "Must be above {endpoint_tolerance} and at most {valve_max} % points.",
         "target_range_empty": "Must be greater than the minimum target temperature."
       },

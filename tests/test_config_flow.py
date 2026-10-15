@@ -1,6 +1,7 @@
 """Tests for the config flow and the room subentry flow."""
 
 import json
+import math
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final
@@ -71,6 +72,7 @@ ERROR_KEYS: Final = (
     "trv_entity_disabled",
     "trv_no_device",
     "not_positive",
+    "not_finite",
     "min_change_out_of_range",
     "target_range_empty",
 )
@@ -328,6 +330,41 @@ async def test_invalid_room_is_refused_on_its_field(
     assert result["type"] is FlowResultType.FORM
     assert result["errors"] == errors
     assert entry.subentries == {}
+
+
+@pytest.mark.parametrize(
+    "field", [CONF_KP, CONF_MIN_CHANGE, CONF_MIN_TARGET, CONF_MAX_TARGET]
+)
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+async def test_non_finite_number_is_refused_on_its_field(
+    hass: HomeAssistant, field: str, value: float
+) -> None:
+    """A NaN or infinite number is refused on its own field only."""
+    entry = await _add_entry(hass)
+
+    result = await _create_room(hass, entry, _room_input(**{field: value}))
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {field: "not_finite"}
+    assert entry.subentries == {}
+
+
+async def test_repeated_selections_are_stored_once(hass: HomeAssistant) -> None:
+    """A sensor or TRV selected twice is stored once, in selection order."""
+    entry = await _add_entry(hass)
+
+    result = await _create_room(
+        hass,
+        entry,
+        _room_input(
+            **{CONF_SENSORS: [SENSOR, SENSOR], CONF_TRVS: [TRV_2, TRV_1, TRV_2]}
+        ),
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    (subentry,) = entry.subentries.values()
+    assert subentry.data[CONF_SENSORS] == [SENSOR]
+    assert subentry.data[CONF_TRVS] == [TRV_2, TRV_1]
 
 
 async def _reconfigure_room(
