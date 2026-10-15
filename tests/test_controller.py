@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from custom_components.room_valve_control.const import DEFAULT_KP, DEFAULT_TI
 from custom_components.room_valve_control.controller import (
     VALVE_MAX,
     VALVE_MIN,
@@ -230,8 +231,8 @@ def test_from_dict_rejects_malformed_state(data: dict[str, object]) -> None:
 
 
 # Simulation: the default gains.
-SIM_KP = 30.0
-SIM_TI = timedelta(minutes=30)
+SIM_KP = DEFAULT_KP
+SIM_TI = DEFAULT_TI
 SIM_SEED = 20261016
 SIM_WARMUP = timedelta(days=1)
 SIM_DURATION = timedelta(days=7)
