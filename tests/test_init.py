@@ -6,6 +6,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Final
 
 import pytest
+from homeassistant.components.climate.const import ATTR_CURRENT_TEMPERATURE
 from homeassistant.config_entries import RELOAD_AFTER_UPDATE_DELAY, ConfigEntryState
 from homeassistant.const import (
     ATTR_ENTITY_ID,
@@ -56,6 +57,8 @@ OTHER_TARGET: Final = 22.0
 RELOAD_DELAY: Final = timedelta(seconds=RELOAD_AFTER_UPDATE_DELAY + 1)
 # Off the TRVs' own setpoint, so a fallback step writes it.
 FALLBACK_TARGET: Final = 20.5
+RENAMED_SENSOR: Final = "sensor.lounge_temperature"
+LOWER_READING: Final = "19.5"
 OTHER_SENSOR: Final = "sensor.living_room_window_temperature"
 RENAMED_CLIMATE: Final = "climate.lounge"
 INTEGRATOR_SENSOR: Final = "sensor.living_room_integrator"
@@ -415,6 +418,29 @@ async def test_removed_wall_sensor_is_dropped(
 
     assert gone in caplog.text
     assert calls == entering_direct()
+
+
+async def test_renamed_wall_sensor_reloads_the_room(
+    hass: HomeAssistant, calls: list[TrvCall]
+) -> None:
+    """A wall sensor given a new entity id is read under it after a reload."""
+    hass.states.async_set(WALL_SENSOR, READING)
+    await async_setup_room(hass)
+    await async_set_room_target(hass, TARGET)
+
+    er.async_get(hass).async_update_entity(WALL_SENSOR, new_entity_id=RENAMED_SENSOR)
+    hass.states.async_remove(WALL_SENSOR)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    hass.states.async_set(RENAMED_SENSOR, LOWER_READING)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    climate = hass.states.get(ROOM_CLIMATE)
+    mode = hass.states.get(MODE_SENSOR)
+    assert climate is not None
+    assert mode is not None
+    assert climate.attributes[ATTR_CURRENT_TEMPERATURE] == float(LOWER_READING)
+    assert mode.state == "direct"
+    assert ("set_hvac_mode", TRVS[0].climate, "heat") in calls
 
 
 async def test_room_without_wall_sensors_falls_back(

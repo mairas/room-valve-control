@@ -9,6 +9,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.event import (
+    async_track_entity_registry_updated_event,
     async_track_state_change_event,
     async_track_state_report_event,
     async_track_time_interval,
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
 
     from homeassistant.config_entries import ConfigSubentry
     from homeassistant.core import Event, EventStateChangedData, EventStateReportedData
+    from homeassistant.helpers.entity_registry import EventEntityRegistryUpdatedData
 
     from .spirit import SpiritTrv
 
@@ -185,6 +187,9 @@ class RoomRuntime:
             async_track_state_report_event(
                 self._hass, self._sensor_ids, self._async_reading_event
             ),
+            async_track_entity_registry_updated_event(
+                self._hass, self._sensor_ids, self._async_sensor_registry_updated
+            ),
         ]
         self._schedule_step(None)
 
@@ -244,6 +249,15 @@ class RoomRuntime:
             dt_util.utcnow(), self.readings()
         ):
             self._schedule_step(self.room.needs_immediate_step)
+
+    @callback
+    def _async_sensor_registry_updated(
+        self, event: Event[EventEntityRegistryUpdatedData]
+    ) -> None:
+        """Reload on a wall sensor's new entity id, which the listeners are keyed by."""
+        data = event.data
+        if data["action"] == "update" and "entity_id" in data["changes"]:
+            self._hass.config_entries.async_schedule_reload(self._entry.entry_id)
 
     @callback
     def _schedule_step(self, condition: StepCondition | None) -> None:
