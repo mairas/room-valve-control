@@ -59,8 +59,8 @@ async def test_thermostat_is_heat_only_on_the_room_device(
     hass: HomeAssistant, calls: list[TrvCall]
 ) -> None:
     """The thermostat sits on a device named after the room."""
-    hass.states.async_set(WALL_SENSOR, "20.3")
     await async_setup_room(hass)
+    hass.states.async_set(WALL_SENSOR, "20.3")
 
     state = hass.states.get(ROOM_CLIMATE)
     assert state is not None
@@ -83,8 +83,8 @@ async def test_target_is_echoed_and_first_target_steps_at_once(
     hass: HomeAssistant, calls: list[TrvCall]
 ) -> None:
     """The first target acts at once; later ones wait for the step in direct."""
-    hass.states.async_set(WALL_SENSOR, "20.0")
     await async_setup_room(hass)
+    hass.states.async_set(WALL_SENSOR, "20.0")
 
     await async_set_room_target(hass, RESTORED_TARGET)
 
@@ -162,8 +162,8 @@ async def test_stored_state_round_trips(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory, calls: list[TrvCall]
 ) -> None:
     """What the thermostat stores is what the steps left behind."""
-    hass.states.async_set(WALL_SENSOR, "20.0")
     await async_setup_room(hass)
+    hass.states.async_set(WALL_SENSOR, "20.0")
     await async_set_room_target(hass, RESTORED_TARGET)
     await async_advance(hass, freezer)
 

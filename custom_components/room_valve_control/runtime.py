@@ -90,6 +90,7 @@ class RoomRuntime:
         self._settings = room_settings(subentry.data)
         self._trvs = trvs
         self.room: Room | None = None
+        self._started_at: datetime | None = None
         self.controller: PIController | None = None
         # Keeps an immediate step's condition and the step together; Room
         # itself serializes its writes.
@@ -131,11 +132,18 @@ class RoomRuntime:
         return lambda: self._listeners.remove(listener)
 
     def readings(self) -> list[Reading]:
-        """Return the wall sensors' numeric states and when they reported."""
+        """
+        Return the wall sensors' numeric states and when they reported.
+
+        A state reported before the room started is left out: at Core start a
+        restored or retained state is reported then, however old its value.
+        """
+        if self._started_at is None:
+            return []
         readings = []
         for sensor_id in self._sensor_ids:
             state = self._hass.states.get(sensor_id)
-            if state is None:
+            if state is None or state.last_reported < self._started_at:
                 continue
             try:
                 value = float(state.state)
@@ -160,11 +168,12 @@ class RoomRuntime:
     ) -> None:
         """Create the room from restored values, start stepping and step once."""
         controller = self._restore_controller(controller_state)
+        self._started_at = dt_util.utcnow()
         room = Room(
             self._settings,
             self._trvs,
             controller,
-            dt_util.utcnow(),
+            self._started_at,
             name=self.name,
             device_writes=device_writes,
         )
