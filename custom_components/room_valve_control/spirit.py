@@ -20,6 +20,7 @@ from homeassistant.components.climate.const import (
 from homeassistant.components.climate.const import DOMAIN as CLIMATE_DOMAIN
 from homeassistant.components.number.const import ATTR_VALUE, SERVICE_SET_VALUE
 from homeassistant.components.number.const import DOMAIN as NUMBER_DOMAIN
+from homeassistant.components.sensor.const import DOMAIN as SENSOR_DOMAIN
 from homeassistant.const import ATTR_ENTITY_ID, ATTR_TEMPERATURE, STATE_UNAVAILABLE
 from homeassistant.core import Event, EventStateChangedData, callback
 from homeassistant.exceptions import HomeAssistantError
@@ -47,6 +48,15 @@ COMMAND_CLASS_CONFIGURATION: Final = 112
 VALVE_PROPERTY: Final = "currentValue"
 OFFSET_PARAMETER: Final = 8
 _VALUE_ID_PARTS: Final = 4
+
+# The node status sensor's unique id is "<home id>.<node>.node_status"; it is
+# enabled by default and reads alive, asleep, awake, dead or unknown. zwave_js
+# keeps a dead node's value entities available.
+NODE_STATUS_UNIQUE_ID_SUFFIX: Final = ".node_status"
+NODE_STATUS_DEAD: Final = "dead"
+
+# Seconds to wait for a blocking service call to an unresponsive node.
+SERVICE_TIMEOUT: Final = 30.0
 
 # Thermostat Mode 31, valve-position mode; zwave_js lists it as a preset and
 # reports no hvac_mode while it is active.
@@ -149,13 +159,24 @@ class SpiritTrv:
         if climate.device_id is None:
             raise SpiritEntityError(SpiritEntity.CLIMATE, climate_entity_id)
         self.climate_entity_id = climate.entity_id
+        device_entries = er.async_entries_for_device(
+            registry, climate.device_id, include_disabled_entities=True
+        )
         numbers = [
             entry
-            for entry in er.async_entries_for_device(
-                registry, climate.device_id, include_disabled_entities=True
-            )
+            for entry in device_entries
             if entry.domain == NUMBER_DOMAIN and entry.platform == ZWAVE_JS_DOMAIN
         ]
+        self._node_status_unique_id = next(
+            (
+                entry.unique_id
+                for entry in device_entries
+                if entry.domain == SENSOR_DOMAIN
+                and entry.platform == ZWAVE_JS_DOMAIN
+                and entry.unique_id.endswith(NODE_STATUS_UNIQUE_ID_SUFFIX)
+            ),
+            None,
+        )
         self.valve_entity_id = _find_number(
             numbers,
             SpiritEntity.VALVE_CONTROL,
@@ -171,9 +192,17 @@ class SpiritTrv:
 
     @property
     def available(self) -> bool:
-        """Return whether the climate entity reports a state."""
+        """Return whether the climate entity reports and the node is not dead."""
         state = self._hass.states.get(self.climate_entity_id)
-        return state is not None and state.state != STATE_UNAVAILABLE
+        if state is None or state.state == STATE_UNAVAILABLE:
+            return False
+        if self._node_status_unique_id is None:
+            return True
+        status_id = er.async_get(self._hass).async_get_entity_id(
+            SENSOR_DOMAIN, ZWAVE_JS_DOMAIN, self._node_status_unique_id
+        )
+        status = None if status_id is None else self._hass.states.get(status_id)
+        return status is None or status.state != NODE_STATUS_DEAD
 
     @property
     def mode(self) -> TrvMode:
@@ -293,7 +322,10 @@ class SpiritTrv:
         return True
 
     async def set_valve(self, percent: int) -> bool:
-        """Write the valve number."""
+        """Write the valve number, unless the number entity is unavailable."""
+        state = self._hass.states.get(self.valve_entity_id)
+        if state is None or state.state == STATE_UNAVAILABLE:
+            return False
         return await self._call(
             NUMBER_DOMAIN,
             SERVICE_SET_VALUE,
@@ -332,8 +364,22 @@ class SpiritTrv:
         if not self.available:
             return False
         try:
-            await self._hass.services.async_call(domain, service, data, blocking=True)
-        except (HomeAssistantError, vol.Invalid) as err:
+            async with asyncio.timeout(SERVICE_TIMEOUT):
+                await self._hass.services.async_call(
+                    domain, service, data, blocking=True
+                )
+        except TimeoutError:
+            _LOGGER.warning(
+                "%s: %s.%s timed out after %s s",
+                self.climate_entity_id,
+                domain,
+                service,
+                SERVICE_TIMEOUT,
+            )
+            return False
+        # zwave_js entity methods raise ValueError and KeyError for values the
+        # node does not offer in its current mode.
+        except (HomeAssistantError, vol.Invalid, ValueError, KeyError) as err:
             _LOGGER.warning(
                 "%s: %s.%s failed: %s", self.climate_entity_id, domain, service, err
             )
