@@ -36,6 +36,7 @@ START: Final = datetime(2026, 10, 16, 6, 0, tzinfo=UTC)
 TARGET: Final = 21.0
 OTHER_TARGET: Final = 22.5
 LATEST_TARGET: Final = 23.0
+RESTORED_INTEGRAL: Final = 10.0
 
 Call = tuple[object, ...]
 
@@ -883,15 +884,26 @@ async def test_failed_reentry_after_external_change_warns_once(
     assert warnings(caplog) == []
 
 
-async def test_first_direct_step_integrates_one_control_step() -> None:
-    """With no previous direct step the elapsed time is the control step."""
-    room = make_room([FakeTrv(valve=0.0)])
+async def test_first_direct_step_does_not_integrate() -> None:
+    """A new room has had no interval to integrate over, restored or not."""
+    room = make_room([FakeTrv(valve=0.0)], integral=RESTORED_INTEGRAL)
     await room.set_target(TARGET)
 
     await room.step(START, fresh(20.0, START))
 
+    assert room.integrator == RESTORED_INTEGRAL
+    assert room.last_output == round(KP * 1.0 + RESTORED_INTEGRAL)
+
+
+async def test_second_direct_step_integrates_the_time_since_the_first() -> None:
+    """Integration starts from the room's first direct step."""
+    room = make_room([FakeTrv(valve=0.0)])
+    await go_direct(room)
     expected = PIController(GAINS)
     expected.step(TARGET, 20.0, CONTROL_STEP, integrate=True)
+
+    await room.step(at(15), fresh(20.0, at(15)))
+
     assert room.integrator == pytest.approx(expected.integral)
 
 

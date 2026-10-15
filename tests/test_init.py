@@ -54,6 +54,8 @@ RELOAD_DELAY: Final = timedelta(seconds=RELOAD_AFTER_UPDATE_DELAY + 1)
 FALLBACK_TARGET: Final = 20.5
 OTHER_SENSOR: Final = "sensor.living_room_window_temperature"
 RENAMED_CLIMATE: Final = "climate.lounge"
+INTEGRATOR_SENSOR: Final = "sensor.living_room_integrator"
+MODE_SENSOR: Final = "sensor.living_room_control_mode"
 STEPS_IN_STARTUP_GRACE: Final = DEFAULT_STALE_TIMEOUT // DEFAULT_CONTROL_STEP - 1
 
 
@@ -158,8 +160,8 @@ async def test_reading_change_in_direct_waits_for_next_step(
 
     await async_advance(hass, freezer)
 
-    # 1.5 °C error: 45 % proportional plus the 15 % integrated so far.
-    assert calls == [("set_value", ids.valve, 60) for ids in TRVS]
+    # 1.5 °C error: 45 % proportional; the first step integrated nothing.
+    assert calls == [("set_value", ids.valve, 45) for ids in TRVS]
 
 
 async def test_unchanged_value_reported_after_fallback_steps_back_to_direct(
@@ -181,13 +183,13 @@ async def test_unchanged_value_reported_after_fallback_steps_back_to_direct(
     reported = hass.states.get(WALL_SENSOR)
     assert reported is not None
     assert reported.last_changed == reported_before.last_changed
-    # Four direct steps integrated 60 %, which the fallback kept.
+    # Three intervals of direct steps integrated 45 %, which the fallback kept.
     assert calls == [
         call
         for ids in TRVS
         for call in (
             ("set_preset_mode", ids.climate, DIRECT_MODE_PRESET),
-            ("set_value", ids.valve, 90),
+            ("set_value", ids.valve, 75),
         )
     ]
 
@@ -357,6 +359,36 @@ async def test_reload_hands_back_once(
     assert ("set_hvac_mode", TRVS[0].climate, "heat") not in calls[len(handed_back) :]
 
 
+@pytest.mark.usefixtures("calls")
+async def test_reload_does_not_integrate_a_step(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """A room reloaded with new gains resumes from the integral it had."""
+    hass.states.async_set(WALL_SENSOR, READING)
+    entry = await async_setup_room(hass)
+    await async_set_room_target(hass, TARGET)
+    await async_advance(hass, freezer)
+    integrator = hass.states.get(INTEGRATOR_SENSOR)
+    assert integrator is not None
+    integral = float(integrator.state)
+    assert integral > 0
+    subentry = entry.subentries[ROOM_ID]
+
+    hass.config_entries.async_update_subentry(
+        entry, subentry, data={**subentry.data, CONF_KP: 40.0}
+    )
+    await hass.async_block_till_done()
+    hass.states.async_set(WALL_SENSOR, READING, force_update=True)
+    await hass.async_block_till_done()
+
+    mode = hass.states.get(MODE_SENSOR)
+    integrator = hass.states.get(INTEGRATOR_SENSOR)
+    assert mode is not None
+    assert integrator is not None
+    assert mode.state == "direct"
+    assert float(integrator.state) == pytest.approx(integral)
+
+
 async def test_renamed_climate_entity_keeps_the_room_running(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory, calls: list[TrvCall]
 ) -> None:
@@ -375,4 +407,4 @@ async def test_renamed_climate_entity_keeps_the_room_running(
     assert renamed is not None
     assert renamed.attributes[ATTR_TEMPERATURE] == TARGET
     # One step on the single, still running room: see the direct-mode test.
-    assert calls == [("set_value", ids.valve, 60) for ids in TRVS]
+    assert calls == [("set_value", ids.valve, 45) for ids in TRVS]
