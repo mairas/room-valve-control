@@ -114,6 +114,11 @@ class Room:
         return self._controller.integral
 
     @property
+    def controller_state(self) -> dict[str, float]:
+        """Return the PI controller's state to store across restarts."""
+        return self._controller.as_dict()
+
+    @property
     def device_writes(self) -> int:
         """Return the number of writes sent to the TRVs."""
         return self._device_writes

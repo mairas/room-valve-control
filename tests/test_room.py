@@ -979,3 +979,14 @@ async def test_current_reading_is_mean_of_fresh_finite_readings() -> None:
 
     assert room.current_reading(now, readings) == pytest.approx(20.5)
     assert room.current_reading(now, [Reading(math.nan, now)]) is None
+
+
+async def test_controller_state_is_what_the_controller_restores_from() -> None:
+    """The room's controller state restores a controller with its integral."""
+    room = make_room([FakeTrv(valve=0.0)])
+    await go_direct(room)
+    await room.step(at(15), fresh(20.0, at(15)))
+
+    restored = PIController.from_dict(GAINS, room.controller_state)
+
+    assert restored.integral == room.integrator > 0
