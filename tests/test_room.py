@@ -166,6 +166,17 @@ async def test_fresh_reading_below_target_enters_direct_and_writes_valve() -> No
     assert room.device_writes == 2  # noqa: PLR2004
 
 
+async def test_entering_direct_writes_valve_despite_matching_readback() -> None:
+    """On entering mode 31 the valve takes its last mode-31 value; the readback lags."""
+    trv = FakeTrv(valve=15.0)
+    room = make_room([trv])
+    await room.set_target(TARGET)
+
+    await room.step(START, fresh(20.49, START))
+
+    assert trv.calls == [("direct",), ("valve", 15)]
+
+
 async def test_small_error_writes_nothing_until_output_moves_by_min_change() -> None:
     """A 0.1 °C error only writes once the integrator moves the output 5 %."""
     trv = FakeTrv(mode=TrvMode.DIRECT, valve=40.0)
