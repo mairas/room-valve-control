@@ -350,6 +350,40 @@ async def test_unload_hands_back_past_a_stalled_step(
 
 
 @pytest.mark.usefixtures("zwave_js_flow")
+async def test_target_shows_while_a_step_is_stalled(hass: HomeAssistant) -> None:
+    """The thermostat echoes a new target without waiting for a stalled step."""
+    calls: list[TrvCall] = []
+    trvs = await async_setup_spirits(hass, calls)
+    hass.states.async_set(WALL_SENSOR, READING)
+    await async_setup_room(hass)
+    stall = asyncio.Event()
+    trvs[1].stall_valve = stall
+    await _async_stall_the_first_step(hass, calls)
+
+    set_target = hass.async_create_task(
+        hass.services.async_call(
+            "climate",
+            "set_temperature",
+            {ATTR_ENTITY_ID: ROOM_CLIMATE, ATTR_TEMPERATURE: OTHER_TARGET},
+            blocking=True,
+        )
+    )
+
+    def shows_target() -> bool:
+        state = hass.states.get(ROOM_CLIMATE)
+        assert state is not None
+        return bool(state.attributes[ATTR_TEMPERATURE] == OTHER_TARGET)
+
+    await async_wait_for(shows_target)
+    valve = hass.states.get(TRVS[1].valve)
+    assert valve is not None
+    assert float(valve.state) == 0  # the step is still stalled
+    stall.set()
+    await set_target
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+
+@pytest.mark.usefixtures("zwave_js_flow")
 async def test_removed_trv_leaves_the_entry_not_ready(hass: HomeAssistant) -> None:
     """A TRV whose registry entry is gone needs the room reconfigured."""
     await async_setup_spirits(hass, [])
