@@ -31,12 +31,6 @@ files = ["custom_components", "tests"]
 module = "pytest_homeassistant_custom_component.*"
 follow_untyped_imports = true
 
-# mypy keeps an attribute narrowed across an await, so re-checking state that
-# the awaited call changed (entry.state after an unload) reads as unreachable.
-[[tool.mypy.overrides]]
-module = "tests.*"
-disable_error_code = ["comparison-overlap"]
-
 # Based on https://github.com/ludeeus/integration_blueprint/blob/main/.ruff.toml,
 # itself based on Home Assistant Core's pyproject.toml.
 [tool.ruff]
