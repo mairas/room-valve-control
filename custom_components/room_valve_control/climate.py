@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Final, Self, override
 
 from homeassistant.components.climate import ClimateEntity
 from homeassistant.components.climate.const import ClimateEntityFeature, HVACMode
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import ATTR_TEMPERATURE, PRECISION_TENTHS, UnitOfTemperature
 from homeassistant.helpers.restore_state import ExtraStoredData, RestoreEntity
 
@@ -132,17 +133,28 @@ class RoomClimate(ClimateEntity, RestoreEntity):
         )
 
     @override
-    async def async_will_remove_from_hass(self) -> None:
-        """Hand the room back unless the entity is only getting a new entity id."""
-        entry = self.registry_entry
+    async def async_internal_will_remove_from_hass(self) -> None:
+        """
+        Hand the room back when the thermostat is disabled or removed.
+
+        Done before RestoreEntity saves the state, so the saved write count
+        includes the hand back. Not done for a new entity id, after which the
+        entity is re-added to the running room, nor while the entry unloads,
+        which has handed the room back already.
+        """
+        registry_entry = self.registry_entry
         renamed = (
-            entry is not None
-            and not entry.disabled
-            and entry.entity_id != self.entity_id
+            registry_entry is not None
+            and not registry_entry.disabled
+            and registry_entry.entity_id != self.entity_id
         )
-        if not renamed:
+        config_entry = self.platform.config_entry
+        entry_staying = (
+            config_entry is not None and config_entry.state is ConfigEntryState.LOADED
+        )
+        if not renamed and entry_staying:
             await self._runtime.async_hand_back()
-        await super().async_will_remove_from_hass()
+        await super().async_internal_will_remove_from_hass()
 
     @override
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:

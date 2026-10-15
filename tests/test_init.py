@@ -59,6 +59,7 @@ OTHER_SENSOR: Final = "sensor.living_room_window_temperature"
 RENAMED_CLIMATE: Final = "climate.lounge"
 INTEGRATOR_SENSOR: Final = "sensor.living_room_integrator"
 MODE_SENSOR: Final = "sensor.living_room_control_mode"
+WRITES_SENSOR: Final = "sensor.living_room_device_writes"
 # Seconds the Core stop hand back may take in a test; the writes take far less.
 HAND_BACK_BOUND: Final = 0.1
 STEPS_IN_STARTUP_GRACE: Final = DEFAULT_STALE_TIMEOUT // DEFAULT_CONTROL_STEP - 1
@@ -430,6 +431,29 @@ async def test_climate_entity_going_away_hands_back(
     await async_advance(hass, freezer, RELOAD_DELAY)
     await async_advance(hass, freezer)
     assert calls == handing_back()
+
+
+async def test_reenabled_thermostat_restores_the_hand_back_writes(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, calls: list[TrvCall]
+) -> None:
+    """The write counter saved on disabling includes the hand back's writes."""
+    hass.states.async_set(WALL_SENSOR, READING)
+    await async_setup_room(hass)
+    await async_set_room_target(hass, TARGET)
+    registry = er.async_get(hass)
+    registry.async_update_entity(
+        ROOM_CLIMATE, disabled_by=er.RegistryEntryDisabler.USER
+    )
+    await hass.async_block_till_done(wait_background_tasks=True)
+    await async_advance(hass, freezer, RELOAD_DELAY)
+    assert calls[-len(handing_back()) :] == handing_back()
+
+    registry.async_update_entity(ROOM_CLIMATE, disabled_by=None)
+    await async_advance(hass, freezer, RELOAD_DELAY)
+
+    writes = hass.states.get(WRITES_SENSOR)
+    assert writes is not None
+    assert int(writes.state) == len(calls)
 
 
 async def test_reload_hands_back_once(

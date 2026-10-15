@@ -63,6 +63,9 @@ async def async_unload_entry(
     hass: HomeAssistant, entry: RoomValveControlConfigEntry
 ) -> bool:
     """Hand the TRVs back, then unload the entry's platforms."""
+    # Before the platforms, so that the thermostats save their state after the
+    # hand back; they skip their own hand back while the entry unloads. Without
+    # a deadline: unlike at Core stop, nothing disconnects zwave_js meanwhile.
     await async_hand_back_all(entry.runtime_data.values())
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
