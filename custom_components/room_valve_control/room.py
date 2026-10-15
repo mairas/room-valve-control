@@ -138,16 +138,22 @@ class Room:
 
     async def set_target(self, target: float) -> None:
         """
-        Set the target; in fallback, write it to the TRVs right away.
+        Set the target at once; in fallback, also write it to the TRVs.
 
         Ignored once stopped, so the target stays what the TRVs were handed.
+        Only the fallback write waits for an operation in progress, and it
+        writes the target current when it runs. Every switch into fallback
+        happens under the lock before the step's own write, so outside
+        fallback no write is needed.
         """
+        if self._mode is ControlMode.STOPPED:
+            return
+        self._target = target
+        if self._mode is not ControlMode.FALLBACK:
+            return
         async with self._lock:
-            if self._mode is ControlMode.STOPPED:
-                return
-            self._target = target
             if self._mode is ControlMode.FALLBACK:
-                await self._self_regulate(target)
+                await self._self_regulate(self._target)
 
     async def hand_back(self) -> None:
         """

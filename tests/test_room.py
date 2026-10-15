@@ -34,6 +34,8 @@ SETTINGS: Final = RoomSettings(
 SPIRIT_MAX_OFFSET: Final = 5.0
 START: Final = datetime(2026, 10, 16, 6, 0, tzinfo=UTC)
 TARGET: Final = 21.0
+OTHER_TARGET: Final = 22.5
+LATEST_TARGET: Final = 23.0
 
 Call = tuple[object, ...]
 
@@ -644,6 +646,42 @@ async def test_target_set_during_fallback_step_is_written_after_it() -> None:
     await set_target
 
     assert trv.calls == [("heat",), ("setpoint", TARGET), ("setpoint", 22.5)]
+
+
+async def test_target_set_during_step_is_recorded_at_once() -> None:
+    """A step suspended in a TRV write does not delay the new target."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await room.set_target(TARGET)
+    gate = close_gates(trv)
+    step = asyncio.create_task(room.step(START, fresh(20.0, START)))
+    await trv.suspended.wait()
+
+    set_target = asyncio.create_task(room.set_target(OTHER_TARGET))
+    await settle()
+
+    assert room.target == OTHER_TARGET
+    assert set_target.done()
+    gate.set()
+    await step
+
+
+async def test_fallback_write_after_a_step_uses_the_latest_target() -> None:
+    """Targets queued behind a fallback step write only the one current then."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    gate = close_gates(trv)
+    step = asyncio.create_task(room.step(at(90), []))
+    await trv.suspended.wait()
+
+    first = asyncio.create_task(room.set_target(OTHER_TARGET))
+    second = asyncio.create_task(room.set_target(LATEST_TARGET))
+    await settle()
+    gate.set()
+    await asyncio.gather(step, first, second)
+
+    assert trv.calls == [("heat",), ("setpoint", TARGET), ("setpoint", LATEST_TARGET)]
 
 
 async def test_hand_back_writes_trvs_concurrently() -> None:
