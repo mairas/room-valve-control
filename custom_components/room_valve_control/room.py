@@ -1,5 +1,6 @@
 """Per-room control: waiting, direct valve control, or fallback to the TRVs."""
 
+import asyncio
 import logging
 import math
 from dataclasses import dataclass
@@ -32,6 +33,8 @@ class ControlMode(StrEnum):
     WAITING = "waiting"
     DIRECT = "direct"
     FALLBACK = "fallback"
+    # Handed back for good: the TRVs self-regulate and the room writes nothing.
+    STOPPED = "stopped"
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,10 @@ class Room:
         # The TRVs this room switched to direct mode and has not switched out
         # since; finding one of them elsewhere is an external change.
         self._directed: set[Trv] = set()
+        # One operation at a time: interleaved at a TRV await, a step could put
+        # handed-back TRVs back in direct mode, or a target change could write a
+        # setpoint concurrently with a mode change, which loses the setpoint.
+        self._lock = asyncio.Lock()
 
     @property
     def control_mode(self) -> ControlMode:
@@ -125,23 +132,46 @@ class Room:
     def needs_immediate_step(self, now: datetime, readings: Sequence[Reading]) -> bool:
         """Return whether a fresh reading should end waiting or fallback now."""
         return (
-            self._mode is not ControlMode.DIRECT
+            self._mode in {ControlMode.WAITING, ControlMode.FALLBACK}
             and self.current_reading(now, readings) is not None
         )
 
     async def set_target(self, target: float) -> None:
-        """Set the target; in fallback, write it to the TRVs right away."""
-        self._target = target
-        if self._mode is ControlMode.FALLBACK:
-            await self._self_regulate(target)
+        """
+        Set the target; in fallback, write it to the TRVs right away.
+
+        Ignored once stopped, so the target stays what the TRVs were handed.
+        """
+        async with self._lock:
+            if self._mode is ControlMode.STOPPED:
+                return
+            self._target = target
+            if self._mode is ControlMode.FALLBACK:
+                await self._self_regulate(target)
 
     async def hand_back(self) -> None:
-        """Put every available TRV into self-regulation at the target."""
-        if self._target is not None:
-            await self._self_regulate(self._target)
+        """
+        Stop the room and put every available TRV into self-regulation.
+
+        Waits for a step or target change in progress. The TRVs get the target,
+        if there is one.
+        """
+        async with self._lock:
+            if self._mode is ControlMode.STOPPED:
+                return
+            self._mode = ControlMode.STOPPED
+            self._last_output = None
+            self._last_error = None
+            if self._target is not None:
+                await self._self_regulate(self._target)
 
     async def step(self, now: datetime, readings: Sequence[Reading]) -> None:
-        """Run one control step."""
+        """Run one control step; a stopped room does nothing."""
+        async with self._lock:
+            if self._mode is not ControlMode.STOPPED:
+                await self._step(now, readings)
+
+    async def _step(self, now: datetime, readings: Sequence[Reading]) -> None:
         if self._target is None:
             return
         reading = self.current_reading(now, readings)
