@@ -1,0 +1,282 @@
+"""Eurotronic Spirit Z-Wave Plus TRV over Home Assistant's zwave_js entities."""
+
+import logging
+from enum import StrEnum
+from typing import TYPE_CHECKING, Final
+
+import voluptuous as vol
+from homeassistant.components.climate.const import (
+    ATTR_CURRENT_TEMPERATURE,
+    ATTR_HVAC_MODE,
+    ATTR_PRESET_MODE,
+    SERVICE_SET_HVAC_MODE,
+    SERVICE_SET_PRESET_MODE,
+    SERVICE_SET_TEMPERATURE,
+    HVACMode,
+)
+from homeassistant.components.climate.const import DOMAIN as CLIMATE_DOMAIN
+from homeassistant.components.number.const import ATTR_VALUE, SERVICE_SET_VALUE
+from homeassistant.components.number.const import DOMAIN as NUMBER_DOMAIN
+from homeassistant.const import ATTR_ENTITY_ID, ATTR_TEMPERATURE, STATE_UNAVAILABLE
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_registry as er
+
+from .trv import TrvMode
+
+if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
+
+_LOGGER = logging.getLogger(__name__)
+
+# Not imported from the zwave_js package: importing it needs the Z-Wave server
+# library, which this component does not depend on.
+ZWAVE_JS_DOMAIN: Final = "zwave_js"
+SERVICE_SET_CONFIG_PARAMETER: Final = "set_config_parameter"
+ATTR_CONFIG_PARAMETER: Final = "parameter"
+ATTR_CONFIG_VALUE: Final = "value"
+
+# zwave_js unique ids are "<home id>.<value id>", the value id being
+# "<node>-<command class>-<endpoint>-<property>[-<property key>]".
+COMMAND_CLASS_SWITCH_MULTILEVEL: Final = 38
+COMMAND_CLASS_CONFIGURATION: Final = 112
+VALVE_PROPERTY: Final = "currentValue"
+OFFSET_PARAMETER: Final = 8
+_VALUE_ID_PARTS: Final = 4
+
+# Thermostat Mode 31, valve-position mode; zwave_js lists it as a preset and
+# reports no hvac_mode while it is active.
+DIRECT_MODE_PRESET: Final = "Manufacturer specific"
+SELF_REGULATION_HVAC_MODE: Final = HVACMode.HEAT
+
+# Parameter 8 is in tenths of a °C, -50…50.
+OFFSET_TENTHS_PER_DEGREE: Final = 10
+OFFSET_LIMIT_TENTHS: Final = 50
+
+
+class SpiritEntity(StrEnum):
+    """The entities a Spirit TRV is driven through."""
+
+    CLIMATE = "climate"
+    VALVE_CONTROL = "valve_control"
+    TEMPERATURE_OFFSET = "temperature_offset"
+
+
+class SpiritEntityError(Exception):
+    """A Spirit TRV entity the adapter needs is missing or disabled."""
+
+    def __init__(
+        self, entity: SpiritEntity, entity_id: str | None, *, disabled: bool = False
+    ) -> None:
+        """Record which entity is missing or disabled."""
+        self.entity = entity
+        self.entity_id = entity_id
+        self.disabled = disabled
+        problem = "is disabled" if disabled else "was not found"
+        name = f"{entity} entity {entity_id}" if entity_id else f"{entity} entity"
+        super().__init__(f"Spirit {name} {problem}")
+
+
+def own_temperature(reported: float, offset: float) -> float:
+    """
+    Return the TRV's own reading from the reported temperature.
+
+    Assumes the reported temperature already includes the parameter 8 offset.
+    """
+    return reported - offset
+
+
+def offset_to_tenths(offset: float) -> int:
+    """Return parameter 8's value for an offset in °C, clamped to its range."""
+    tenths = round(offset * OFFSET_TENTHS_PER_DEGREE)
+    return max(-OFFSET_LIMIT_TENTHS, min(OFFSET_LIMIT_TENTHS, tenths))
+
+
+def _is_value(entry: er.RegistryEntry, command_class: int, property_: str) -> bool:
+    _, _, value_id = entry.unique_id.partition(".")
+    parts = value_id.split("-")
+    return (
+        len(parts) == _VALUE_ID_PARTS
+        and parts[1] == str(command_class)
+        and parts[3] == property_
+    )
+
+
+def _usable(
+    entity: SpiritEntity, entry: er.RegistryEntry | None, entity_id: str | None
+) -> er.RegistryEntry:
+    if entry is None:
+        raise SpiritEntityError(entity, entity_id)
+    if entry.disabled:
+        raise SpiritEntityError(entity, entry.entity_id, disabled=True)
+    return entry
+
+
+def _find_number(
+    numbers: list[er.RegistryEntry],
+    entity: SpiritEntity,
+    command_class: int,
+    property_: str,
+) -> str:
+    entry = next((e for e in numbers if _is_value(e, command_class, property_)), None)
+    return _usable(entity, entry, None).entity_id
+
+
+class SpiritTrv:
+    """A Spirit TRV, driven through its climate and number entities."""
+
+    def __init__(self, hass: HomeAssistant, climate_entity_id: str) -> None:
+        """Find the TRV's entities; raise SpiritEntityError if one is unusable."""
+        self._hass = hass
+        registry = er.async_get(hass)
+        climate = _usable(
+            SpiritEntity.CLIMATE,
+            registry.async_get(climate_entity_id),
+            climate_entity_id,
+        )
+        if climate.device_id is None:
+            raise SpiritEntityError(SpiritEntity.CLIMATE, climate_entity_id)
+        self.climate_entity_id = climate.entity_id
+        numbers = [
+            entry
+            for entry in er.async_entries_for_device(
+                registry, climate.device_id, include_disabled_entities=True
+            )
+            if entry.domain == NUMBER_DOMAIN and entry.platform == ZWAVE_JS_DOMAIN
+        ]
+        self.valve_entity_id = _find_number(
+            numbers,
+            SpiritEntity.VALVE_CONTROL,
+            COMMAND_CLASS_SWITCH_MULTILEVEL,
+            VALVE_PROPERTY,
+        )
+        self.offset_entity_id = _find_number(
+            numbers,
+            SpiritEntity.TEMPERATURE_OFFSET,
+            COMMAND_CLASS_CONFIGURATION,
+            str(OFFSET_PARAMETER),
+        )
+
+    @property
+    def available(self) -> bool:
+        """Return whether the climate entity reports a state."""
+        state = self._hass.states.get(self.climate_entity_id)
+        return state is not None and state.state != STATE_UNAVAILABLE
+
+    @property
+    def mode(self) -> TrvMode:
+        """Return direct in mode 31, self-regulating in heat, else unknown."""
+        state = self._hass.states.get(self.climate_entity_id)
+        if state is None or state.state == STATE_UNAVAILABLE:
+            return TrvMode.UNKNOWN
+        if state.attributes.get(ATTR_PRESET_MODE) == DIRECT_MODE_PRESET:
+            return TrvMode.DIRECT
+        if state.state == SELF_REGULATION_HVAC_MODE:
+            return TrvMode.SELF_REGULATING
+        return TrvMode.UNKNOWN
+
+    @property
+    def setpoint(self) -> float | None:
+        """Return the climate entity's target temperature."""
+        return self._climate_attribute(ATTR_TEMPERATURE)
+
+    @property
+    def valve(self) -> float | None:
+        """Return the valve number's state in %."""
+        return self._number_state(self.valve_entity_id)
+
+    @property
+    def offset(self) -> float | None:
+        """Return parameter 8 in °C."""
+        tenths = self._number_state(self.offset_entity_id)
+        return None if tenths is None else tenths / OFFSET_TENTHS_PER_DEGREE
+
+    @property
+    def own_temperature(self) -> float | None:
+        """Return the TRV's reading without its offset."""
+        reported = self._climate_attribute(ATTR_CURRENT_TEMPERATURE)
+        offset = self.offset
+        if reported is None or offset is None:
+            return None
+        return own_temperature(reported, offset)
+
+    async def enter_direct(self) -> bool:
+        """Select the Manufacturer specific preset."""
+        return await self._call(
+            CLIMATE_DOMAIN,
+            SERVICE_SET_PRESET_MODE,
+            {
+                ATTR_ENTITY_ID: self.climate_entity_id,
+                ATTR_PRESET_MODE: DIRECT_MODE_PRESET,
+            },
+        )
+
+    async def enter_self_regulation(self, setpoint: float) -> int:
+        """Set heat mode, then the setpoint, skipping what already matches."""
+        sent = 0
+        if self.mode is not TrvMode.SELF_REGULATING:
+            # The setpoint write is a no-op until the TRV has left mode 31.
+            if not await self._call(
+                CLIMATE_DOMAIN,
+                SERVICE_SET_HVAC_MODE,
+                {
+                    ATTR_ENTITY_ID: self.climate_entity_id,
+                    ATTR_HVAC_MODE: SELF_REGULATION_HVAC_MODE,
+                },
+            ):
+                return sent
+            sent += 1
+        if self.setpoint != setpoint and await self._call(
+            CLIMATE_DOMAIN,
+            SERVICE_SET_TEMPERATURE,
+            {ATTR_ENTITY_ID: self.climate_entity_id, ATTR_TEMPERATURE: setpoint},
+        ):
+            sent += 1
+        return sent
+
+    async def set_valve(self, percent: int) -> bool:
+        """Write the valve number."""
+        return await self._call(
+            NUMBER_DOMAIN,
+            SERVICE_SET_VALUE,
+            {ATTR_ENTITY_ID: self.valve_entity_id, ATTR_VALUE: percent},
+        )
+
+    async def set_offset(self, offset: float) -> bool:
+        """Write parameter 8, clamped to ±5.0 °C in 0.1 °C steps."""
+        return await self._call(
+            ZWAVE_JS_DOMAIN,
+            SERVICE_SET_CONFIG_PARAMETER,
+            {
+                ATTR_ENTITY_ID: self.climate_entity_id,
+                ATTR_CONFIG_PARAMETER: OFFSET_PARAMETER,
+                ATTR_CONFIG_VALUE: offset_to_tenths(offset),
+            },
+        )
+
+    def _climate_attribute(self, attribute: str) -> float | None:
+        state = self._hass.states.get(self.climate_entity_id)
+        if state is None:
+            return None
+        value = state.attributes.get(attribute)
+        return float(value) if isinstance(value, int | float) else None
+
+    def _number_state(self, entity_id: str) -> float | None:
+        state = self._hass.states.get(entity_id)
+        if state is None:
+            return None
+        try:
+            return float(state.state)
+        except ValueError:
+            return None
+
+    async def _call(self, domain: str, service: str, data: dict[str, object]) -> bool:
+        if not self.available:
+            return False
+        try:
+            await self._hass.services.async_call(domain, service, data, blocking=True)
+        except (HomeAssistantError, vol.Invalid) as err:
+            _LOGGER.warning(
+                "%s: %s.%s failed: %s", self.climate_entity_id, domain, service, err
+            )
+            return False
+        return True
