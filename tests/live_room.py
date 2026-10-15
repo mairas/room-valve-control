@@ -120,6 +120,11 @@ class FakeSpiritClimate(ClimateEntity):
         self._attr_target_temperature = TRV_SETPOINT
         self._offset_id = ids.offset
 
+    def set_available(self, *, available: bool) -> None:
+        """Make the TRV's climate entity available or unavailable."""
+        self._attr_available = available
+        self.async_write_ha_state()
+
     @property
     @override
     def current_temperature(self) -> float:
@@ -235,6 +240,30 @@ def registry_ids(hass: HomeAssistant, entity_ids: Sequence[str]) -> list[str]:
     return [entry.id for entry in entries if entry is not None]
 
 
+def room_subentry(
+    subentry_id: str, title: str, *, sensors: Sequence[str], trvs: Sequence[str]
+) -> ConfigSubentryDataWithId:
+    """Return a room subentry storing the given registry ids."""
+    return ConfigSubentryDataWithId(
+        data=DEFAULT_ROOM | {CONF_SENSORS: list(sensors), CONF_TRVS: list(trvs)},
+        subentry_id=subentry_id,
+        subentry_type=SUBENTRY_TYPE_ROOM,
+        title=title,
+        unique_id=None,
+    )
+
+
+async def async_setup_rooms(
+    hass: HomeAssistant, rooms: Sequence[ConfigSubentryDataWithId]
+) -> MockConfigEntry:
+    """Add and set up the entry with the given room subentries."""
+    entry = MockConfigEntry(domain=DOMAIN, subentries_data=list(rooms))
+    entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    return entry
+
+
 async def async_setup_room(
     hass: HomeAssistant,
     *,
@@ -251,34 +280,19 @@ async def async_setup_room(
         sensors = registry_ids(hass, [WALL_SENSOR])
     if trvs is None:
         trvs = registry_ids(hass, [ids.climate for ids in TRVS])
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        subentries_data=[
-            ConfigSubentryDataWithId(
-                data=DEFAULT_ROOM
-                | {
-                    CONF_SENSORS: list(sensors),
-                    CONF_TRVS: list(trvs),
-                },
-                subentry_id=ROOM_ID,
-                subentry_type=SUBENTRY_TYPE_ROOM,
-                title=ROOM_TITLE,
-                unique_id=None,
-            )
-        ],
+    return await async_setup_rooms(
+        hass, [room_subentry(ROOM_ID, ROOM_TITLE, sensors=sensors, trvs=trvs)]
     )
-    entry.add_to_hass(hass)
-    await hass.config_entries.async_setup(entry.entry_id)
-    await hass.async_block_till_done(wait_background_tasks=True)
-    return entry
 
 
-async def async_set_room_target(hass: HomeAssistant, target: float) -> None:
-    """Set the room thermostat's target through the climate service."""
+async def async_set_room_target(
+    hass: HomeAssistant, target: float, climate: str = ROOM_CLIMATE
+) -> None:
+    """Set a room thermostat's target through the climate service."""
     await hass.services.async_call(
         "climate",
         "set_temperature",
-        {ATTR_ENTITY_ID: ROOM_CLIMATE, ATTR_TEMPERATURE: target},
+        {ATTR_ENTITY_ID: climate, ATTR_TEMPERATURE: target},
         blocking=True,
     )
     await hass.async_block_till_done(wait_background_tasks=True)
