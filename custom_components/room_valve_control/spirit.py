@@ -41,9 +41,6 @@ _LOGGER = logging.getLogger(__name__)
 # Not imported from the zwave_js package: importing it needs the Z-Wave server
 # library, which this component does not depend on.
 ZWAVE_JS_DOMAIN: Final = "zwave_js"
-SERVICE_SET_CONFIG_PARAMETER: Final = "set_config_parameter"
-ATTR_CONFIG_PARAMETER: Final = "parameter"
-ATTR_CONFIG_VALUE: Final = "value"
 
 # zwave_js unique ids are "<home id>.<value id>", the value id being
 # "<node>-<command class>-<endpoint>-<property>[-<property key>]".
@@ -433,19 +430,20 @@ class SpiritTrv:
         Sends nothing when parameter 8 already reads the same tenths, so a
         write that would not move the reported temperature never gates it.
         """
+        state = self._hass.states.get(self.offset_entity_id)
+        if state is None or state.state == STATE_UNAVAILABLE:
+            return False
         tenths = offset_to_tenths(offset)
         current = self._number_state(self.offset_entity_id)
         if current is not None and round(current) == tenths:
             return False
         temperature = self._climate_attribute(ATTR_CURRENT_TEMPERATURE)
+        # Not zwave_js.set_config_parameter: its handler gathers the command
+        # with return_exceptions, so a cancelled command surfaces as TypeError.
         sent = await self._call(
-            ZWAVE_JS_DOMAIN,
-            SERVICE_SET_CONFIG_PARAMETER,
-            {
-                ATTR_ENTITY_ID: self.climate_entity_id,
-                ATTR_CONFIG_PARAMETER: OFFSET_PARAMETER,
-                ATTR_CONFIG_VALUE: tenths,
-            },
+            NUMBER_DOMAIN,
+            SERVICE_SET_VALUE,
+            {ATTR_ENTITY_ID: self.offset_entity_id, ATTR_VALUE: tenths},
         )
         if sent:
             self._offset_written_at = dt_util.utcnow()
@@ -491,6 +489,16 @@ class SpiritTrv:
                 domain,
                 service,
                 SERVICE_TIMEOUT,
+            )
+            return False
+        except asyncio.CancelledError:
+            # On a disconnect zwave-js-server-python cancels its pending command
+            # futures, which the blocking call awaits in this task.
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+            _LOGGER.warning(
+                "%s: %s.%s was cancelled", self.climate_entity_id, domain, service
             )
             return False
         # zwave_js entity methods raise ValueError and KeyError for values the

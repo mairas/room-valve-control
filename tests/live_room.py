@@ -111,6 +111,8 @@ class FakeSpiritClimate(ClimateEntity):
         # While set, a preset write is applied only once it is, even if the
         # caller has given up: the node already has the command.
         self.stall_preset: asyncio.Event | None = None
+        # Heat mode writes whose command is cancelled, as on a zwave_js reload.
+        self.cancelled_hvac_mode_writes = 0
         # A preset change not applied yet; the node applies later commands
         # after it, as zwave-js sends a node's commands in order.
         self._pending_preset: asyncio.Task[None] | None = None
@@ -168,6 +170,11 @@ class FakeSpiritClimate(ClimateEntity):
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         self._calls.append(("set_hvac_mode", self.entity_id, hvac_mode))
         await self._after_pending_preset()
+        if self.cancelled_hvac_mode_writes:
+            self.cancelled_hvac_mode_writes -= 1
+            command: asyncio.Future[None] = self.hass.loop.create_future()
+            command.cancel()
+            await command
         if self.stall is not None:
             await self.stall.wait()
         self._attr_hvac_mode = hvac_mode
@@ -218,7 +225,6 @@ async def async_setup_spirits(
     await hass.async_block_till_done(wait_background_tasks=True)
 
     devices = dr.async_get(hass)
-    offsets = {}
     by_valve = {ids.valve: entity for ids, entity in zip(TRVS, entities, strict=True)}
     for ids in TRVS:
         device = devices.async_get_device_by_identifier(
@@ -230,7 +236,6 @@ async def async_setup_spirits(
         add_offset_entity(spirit, ids.offset, disabled_by=offset_disabled_by)
         hass.states.async_set(ids.valve, "0")
         hass.states.async_set(ids.offset, "0")
-        offsets[ids.climate] = ids.offset
 
     async def set_value(call: ServiceCall) -> None:
         entity_id = call.data[ATTR_ENTITY_ID]
@@ -240,13 +245,7 @@ async def async_setup_spirits(
             await trv.stall_valve.wait()
         hass.states.async_set(entity_id, str(float(call.data["value"])))
 
-    async def set_config_parameter(call: ServiceCall) -> None:
-        climate_id = call.data[ATTR_ENTITY_ID]
-        calls.append(("set_config_parameter", climate_id, call.data["value"]))
-        hass.states.async_set(offsets[climate_id], str(float(call.data["value"])))
-
     hass.services.async_register("number", "set_value", set_value)
-    hass.services.async_register(ZWAVE_JS, "set_config_parameter", set_config_parameter)
     return entities
 
 
