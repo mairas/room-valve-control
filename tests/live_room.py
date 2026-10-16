@@ -225,7 +225,6 @@ async def async_setup_spirits(
     await hass.async_block_till_done(wait_background_tasks=True)
 
     devices = dr.async_get(hass)
-    offsets = {}
     by_valve = {ids.valve: entity for ids, entity in zip(TRVS, entities, strict=True)}
     for ids in TRVS:
         device = devices.async_get_device_by_identifier(
@@ -237,7 +236,6 @@ async def async_setup_spirits(
         add_offset_entity(spirit, ids.offset, disabled_by=offset_disabled_by)
         hass.states.async_set(ids.valve, "0")
         hass.states.async_set(ids.offset, "0")
-        offsets[ids.climate] = ids.offset
 
     async def set_value(call: ServiceCall) -> None:
         entity_id = call.data[ATTR_ENTITY_ID]
@@ -247,13 +245,7 @@ async def async_setup_spirits(
             await trv.stall_valve.wait()
         hass.states.async_set(entity_id, str(float(call.data["value"])))
 
-    async def set_config_parameter(call: ServiceCall) -> None:
-        climate_id = call.data[ATTR_ENTITY_ID]
-        calls.append(("set_config_parameter", climate_id, call.data["value"]))
-        hass.states.async_set(offsets[climate_id], str(float(call.data["value"])))
-
     hass.services.async_register("number", "set_value", set_value)
-    hass.services.async_register(ZWAVE_JS, "set_config_parameter", set_config_parameter)
     return entities
 
 

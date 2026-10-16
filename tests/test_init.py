@@ -88,7 +88,7 @@ def entering_direct(output: int = OUTPUT) -> list[TrvCall]:
         for call in (
             ("set_preset_mode", ids.climate, DIRECT_MODE_PRESET),
             ("set_value", ids.valve, output),
-            ("set_config_parameter", ids.climate, OFFSET_TENTHS),
+            ("set_value", ids.offset, OFFSET_TENTHS),
         )
     ]
 
