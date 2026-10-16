@@ -7,7 +7,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
 import pytest
-from homeassistant.components.climate.const import ATTR_CURRENT_TEMPERATURE
+from homeassistant.components.climate.const import ATTR_CURRENT_TEMPERATURE, HVACMode
 from homeassistant.config_entries import (
     RELOAD_AFTER_UPDATE_DELAY,
     ConfigEntryDisabler,
@@ -18,11 +18,16 @@ from homeassistant.const import (
     ATTR_ENTITY_ID,
     ATTR_TEMPERATURE,
     EVENT_HOMEASSISTANT_STARTED,
+    STATE_UNAVAILABLE,
     STATE_UNKNOWN,
 )
-from homeassistant.core import CoreState
+from homeassistant.core import CoreState, State
 from homeassistant.helpers import entity_registry as er
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from homeassistant.helpers import issue_registry as ir
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    mock_restore_cache_with_extra_data,
+)
 
 from custom_components.room_valve_control.const import (
     CONF_KP,
@@ -30,6 +35,8 @@ from custom_components.room_valve_control.const import (
     DEFAULT_CONTROL_STEP,
     DEFAULT_STALE_TIMEOUT,
     DOMAIN,
+    ISSUE_ROOM_WITHOUT_TRVS,
+    ISSUE_UNUSABLE_TRV,
     SUBENTRY_TYPE_ROOM,
 )
 from custom_components.room_valve_control.room import ControlMode
@@ -122,21 +129,6 @@ async def test_setup_and_unload_entry(hass: HomeAssistant) -> None:
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done(wait_background_tasks=True)
     assert entry.state is ConfigEntryState.NOT_LOADED
-
-
-@pytest.mark.usefixtures("zwave_js_flow")
-async def test_disabled_offset_entity_retries_setup(hass: HomeAssistant) -> None:
-    """A TRV whose parameter 8 entity is disabled leaves the entry not ready."""
-    await async_setup_spirits(
-        hass, [], offset_disabled_by=er.RegistryEntryDisabler.USER
-    )
-
-    entry = await async_setup_room(hass)
-
-    assert entry.state is ConfigEntryState.SETUP_RETRY
-    assert entry.reason is not None
-    assert TRVS[0].offset in entry.reason
-    assert hass.states.get(ROOM_CLIMATE) is None
 
 
 async def test_unknown_sensor_writes_nothing_until_stale_timeout(
@@ -430,11 +422,238 @@ async def test_removing_a_trv_from_its_room_writes_nothing(
     assert calls == [("set_value", TRVS[0].valve, LOWER_OUTPUT)]
 
 
+def unusable_trv_issue(hass: HomeAssistant, registry_id: str) -> object:
+    """Return the repair issue raised for an unusable TRV, or None."""
+    return ir.async_get(hass).async_get_issue(
+        DOMAIN, f"{ISSUE_UNUSABLE_TRV}_{registry_id}"
+    )
+
+
+def restore_rooms(hass: HomeAssistant, targets: dict[str, float]) -> None:
+    """Make the room thermostats, by entity id, restore the given targets."""
+    mock_restore_cache_with_extra_data(
+        hass,
+        [
+            (
+                State(climate, HVACMode.HEAT),
+                {
+                    "target": target,
+                    "controller": None,
+                    "device_writes": 0,
+                },
+            )
+            for climate, target in targets.items()
+        ],
+    )
+
+
 def disable(hass: HomeAssistant, entity_id: str) -> None:
     """Disable an entity in the registry."""
     er.async_get(hass).async_update_entity(
         entity_id, disabled_by=er.RegistryEntryDisabler.USER
     )
+
+
+@pytest.mark.usefixtures("zwave_js_flow")
+async def test_trv_without_registry_entry_is_skipped(hass: HomeAssistant) -> None:
+    """A TRV whose registry entry is gone is skipped; the room runs without it."""
+    calls: list[TrvCall] = []
+    trvs = await async_setup_spirits(hass, calls)
+    trvs[0].set_direct()
+    stored = registry_ids(hass, [ids.climate for ids in TRVS])
+    er.async_get(hass).async_remove(TRVS[1].climate)
+    hass.states.async_set(WALL_SENSOR, READING)
+    restore_rooms(hass, {ROOM_CLIMATE: TARGET})
+
+    entry = await async_setup_room(hass, trvs=stored)
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert calls == [
+        ("set_value", TRVS[0].valve, OUTPUT),
+        ("set_value", TRVS[0].offset, OFFSET_TENTHS),
+    ]
+    assert unusable_trv_issue(hass, stored[1]) is not None
+
+
+@pytest.mark.usefixtures("zwave_js_flow")
+async def test_unusable_trv_is_left_as_it_is(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A TRV with a disabled offset entity is skipped and not written."""
+    calls: list[TrvCall] = []
+    trvs = await async_setup_spirits(hass, calls)
+    for trv in trvs:
+        trv.set_direct()
+    disable(hass, TRVS[1].offset)
+    hass.states.async_set(WALL_SENSOR, READING)
+    restore_rooms(hass, {ROOM_CLIMATE: TARGET})
+
+    with caplog.at_level(logging.WARNING):
+        await async_setup_room(hass)
+
+    assert TRVS[1].offset in caplog.text
+    assert calls == [
+        ("set_value", TRVS[0].valve, OUTPUT),
+        ("set_value", TRVS[0].offset, OFFSET_TENTHS),
+    ]
+    assert unusable_trv_issue(hass, registry_ids(hass, [TRVS[1].climate])[0])
+
+
+@pytest.mark.usefixtures("zwave_js_flow")
+async def test_room_without_usable_trv_is_not_set_up(hass: HomeAssistant) -> None:
+    """The other rooms run; the room has no entities and its TRV is not written."""
+    calls: list[TrvCall] = []
+    trvs = await async_setup_spirits(hass, calls)
+    trvs[1].set_direct()
+    disable(hass, TRVS[1].offset)
+    hass.states.async_set(WALL_SENSOR, READING)
+    restore_rooms(hass, {ROOM_CLIMATE: TARGET, OTHER_ROOM_CLIMATE: OTHER_TARGET})
+
+    entry = await _async_setup_two_rooms(hass)
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert hass.states.get(ROOM_CLIMATE) is not None
+    assert hass.states.get(OTHER_ROOM_CLIMATE) is None
+    assert ir.async_get(hass).async_get_issue(
+        DOMAIN, f"{ISSUE_ROOM_WITHOUT_TRVS}_{OTHER_ROOM_ID}"
+    )
+    assert unusable_trv_issue(hass, registry_ids(hass, [TRVS[1].climate])[0])
+    assert [call for call in calls if call[1] == TRVS[1].climate] == []
+    assert ("set_preset_mode", TRVS[0].climate, DIRECT_MODE_PRESET) in calls
+
+
+async def test_reload_skips_a_trv_made_unusable(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, calls: list[TrvCall]
+) -> None:
+    """A kept TRV whose entity was disabled while running is caught on reload."""
+    hass.states.async_set(WALL_SENSOR, READING)
+    entry = await async_setup_room(hass)
+    await async_set_room_target(hass, TARGET)
+    calls.clear()
+    disable(hass, TRVS[0].offset)
+
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    hass.states.async_set(WALL_SENSOR, LOWER_READING)
+    await async_advance(hass, freezer)
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert unusable_trv_issue(hass, registry_ids(hass, [TRVS[0].climate])[0])
+    assert [
+        call
+        for call in calls
+        if call[1] in {TRVS[0].climate, TRVS[0].valve, TRVS[0].offset}
+    ] == []
+    assert ("set_value", TRVS[1].valve, LOWER_OUTPUT) in calls
+
+
+async def test_fixed_trv_clears_its_issue(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, calls: list[TrvCall]
+) -> None:
+    """Once the TRV validates again, the next setup drops the issue and drives it."""
+    hass.states.async_set(WALL_SENSOR, READING)
+    entry = await async_setup_room(hass)
+    await async_set_room_target(hass, TARGET)
+    disable(hass, TRVS[0].offset)
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    er.async_get(hass).async_update_entity(TRVS[0].offset, disabled_by=None)
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    calls.clear()
+    hass.states.async_set(WALL_SENSOR, LOWER_READING)
+    await async_advance(hass, freezer)
+
+    assert unusable_trv_issue(hass, registry_ids(hass, [TRVS[0].climate])[0]) is None
+    assert calls == [("set_value", ids.valve, LOWER_OUTPUT) for ids in TRVS]
+
+
+async def test_unconfigured_trv_clears_its_issue(
+    hass: HomeAssistant, calls: list[TrvCall]
+) -> None:
+    """Taking an unusable TRV out of its room drops its issue."""
+    hass.states.async_set(WALL_SENSOR, READING)
+    disable(hass, TRVS[1].offset)
+    entry = await async_setup_room(hass)
+    await async_set_room_target(hass, TARGET)
+    trv_1 = registry_ids(hass, [TRVS[1].climate])[0]
+    assert unusable_trv_issue(hass, trv_1) is not None
+    calls.clear()
+    subentry = entry.subentries[ROOM_ID]
+
+    hass.config_entries.async_update_subentry(
+        entry,
+        subentry,
+        data={**subentry.data, CONF_TRVS: registry_ids(hass, [TRVS[0].climate])},
+    )
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert unusable_trv_issue(hass, trv_1) is None
+    assert calls == []
+
+
+async def test_deleting_the_entry_clears_its_issues(
+    hass: HomeAssistant,
+    calls: list[TrvCall],  # noqa: ARG001
+) -> None:
+    """A deleted entry leaves no repair issue behind."""
+    disable(hass, TRVS[1].offset)
+    entry = await async_setup_room(hass)
+    assert unusable_trv_issue(hass, registry_ids(hass, [TRVS[1].climate])[0])
+
+    await hass.config_entries.async_remove(entry.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert [domain for domain, _ in ir.async_get(hass).issues if domain == DOMAIN] == []
+
+
+async def test_disabling_the_entry_clears_its_issues(
+    hass: HomeAssistant,
+    calls: list[TrvCall],  # noqa: ARG001
+) -> None:
+    """A disabled entry controls nothing, so no issue says otherwise."""
+    disable(hass, TRVS[1].offset)
+    entry = await async_setup_room(hass)
+    assert unusable_trv_issue(hass, registry_ids(hass, [TRVS[1].climate])[0])
+
+    assert await _async_disable(hass, entry)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert [domain for domain, _ in ir.async_get(hass).issues if domain == DOMAIN] == []
+
+
+async def test_room_back_from_no_usable_trv_restores_its_state(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    calls: list[TrvCall],  # noqa: ARG001
+) -> None:
+    """A room set up again once its TRV is fixed has its target and integrator."""
+    hass.states.async_set(WALL_SENSOR, READING)
+    entry = await async_setup_room(hass, trvs=registry_ids(hass, [TRVS[0].climate]))
+    await async_set_room_target(hass, TARGET)
+    await async_advance(hass, freezer)
+    integrator = hass.states.get(INTEGRATOR_SENSOR)
+    assert integrator is not None
+    integral = float(integrator.state)
+    assert integral > 0
+    disable(hass, TRVS[0].offset)
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    gone = hass.states.get(ROOM_CLIMATE)
+    assert gone is not None
+    assert gone.state == STATE_UNAVAILABLE
+
+    er.async_get(hass).async_update_entity(TRVS[0].offset, disabled_by=None)
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    climate = hass.states.get(ROOM_CLIMATE)
+    integrator = hass.states.get(INTEGRATOR_SENSOR)
+    assert climate is not None
+    assert integrator is not None
+    assert climate.attributes[ATTR_TEMPERATURE] == TARGET
+    assert float(integrator.state) == pytest.approx(integral)
 
 
 @pytest.mark.usefixtures("zwave_js_flow")
@@ -629,23 +848,6 @@ async def test_trvs_unavailable_at_setup_are_driven_once_available(
 
     assert ("set_preset_mode", TRVS[0].climate, DIRECT_MODE_PRESET) in calls
     assert ("set_preset_mode", TRVS[1].climate, DIRECT_MODE_PRESET) in calls
-
-
-@pytest.mark.usefixtures("zwave_js_flow")
-async def test_removed_trv_leaves_the_entry_not_ready(hass: HomeAssistant) -> None:
-    """A TRV whose registry entry is gone needs the room reconfigured."""
-    await async_setup_spirits(hass, [])
-    stored = registry_ids(hass, [ids.climate for ids in TRVS])
-    er.async_get(hass).async_remove(TRVS[1].climate)
-    await hass.async_block_till_done(wait_background_tasks=True)
-
-    entry = await async_setup_room(hass, trvs=stored)
-
-    assert entry.state is ConfigEntryState.SETUP_RETRY
-    assert entry.reason is not None
-    assert ROOM_TITLE in entry.reason
-    assert stored[1] in entry.reason
-    assert hass.states.get(ROOM_CLIMATE) is None
 
 
 async def test_removed_wall_sensor_is_dropped(
