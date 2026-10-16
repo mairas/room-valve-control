@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from datetime import timedelta
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, CoreState, HomeAssistant, callback
@@ -33,7 +33,7 @@ from .registry import entity_ids
 from .room import Reading, Room, RoomSettings
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
     from datetime import datetime
 
     from homeassistant.config_entries import ConfigSubentry
@@ -43,13 +43,6 @@ if TYPE_CHECKING:
     from .spirit import SpiritTrv
 
 _LOGGER = logging.getLogger(__name__)
-
-# Seconds for handing every room back at Core stop. Core gives all shutdown jobs
-# together 20 s (STOPPING_STAGE_SHUTDOWN_TIMEOUT) before it fires the stop
-# event, on which zwave_js disconnects; this leaves room for the other jobs and
-# for logging what was cut off. A TRV stalled in its 30 s service timeout is
-# cut off.
-HAND_BACK_TIMEOUT: Final = 15.0
 
 type StepCondition = Callable[[datetime, Sequence[Reading]], bool]
 type RoomValveControlConfigEntry = ConfigEntry[dict[str, RoomRuntime]]
@@ -63,9 +56,13 @@ class RoomRuntime:
         hass: HomeAssistant,
         entry: RoomValveControlConfigEntry,
         subentry: ConfigSubentry,
-        trvs: Sequence[SpiritTrv],
+        trvs: Mapping[str, SpiritTrv],
     ) -> None:
-        """Hold the room's configuration; the room starts with async_start."""
+        """
+        Hold the room's configuration; the room starts with async_start.
+
+        trvs are keyed by the entity registry ids the subentry stores.
+        """
         self._hass = hass
         self._entry = entry
         self.subentry_id = subentry.subentry_id
@@ -90,10 +87,10 @@ class RoomRuntime:
         # itself serializes its writes.
         self._step_lock = asyncio.Lock()
         self._stepped_with_target = False
-        # Every step in flight or waiting for the step lock, so that handing
-        # back can cancel them instead of waiting behind a stalled TRV write.
+        # Every step in flight or waiting for the step lock, so that stopping
+        # can cancel them instead of waiting behind a stalled TRV write.
         self._step_tasks: set[asyncio.Task[None]] = set()
-        self._handing_back = False
+        self._stopped = False
         self._unsubscribes: list[CALLBACK_TYPE] = []
         self._listeners: list[CALLBACK_TYPE] = []
 
@@ -164,7 +161,7 @@ class RoomRuntime:
         controller = self._restore_controller(controller_state)
         room = Room(
             self._settings,
-            self._trvs,
+            list(self._trvs.values()),
             controller,
             dt_util.utcnow(),
             name=self.name,
@@ -224,30 +221,43 @@ class RoomRuntime:
         self._notify()
         self._schedule_step(lambda _now, _readings: not self._stepped_with_target)
 
-    async def async_hand_back(self) -> None:
-        """
-        Stop stepping and put the room's TRVs into self-regulation, once.
+    @property
+    def trvs(self) -> Mapping[str, SpiritTrv]:
+        """Return the room's TRVs by entity registry id."""
+        return self._trvs
 
-        Cancels the steps in flight first, which releases the room's lock.
+    async def async_stop(self) -> None:
         """
-        self._handing_back = True
+        Stop the room, leaving the TRVs as they are.
+
+        Returns once a target change in progress has finished. The room stops
+        in the queue for its lock, so a target change arriving later only
+        records the target.
+        """
+        steps = self._stop_stepping()
+        if self.room is not None:
+            await self.room.stop()
+        await _async_wait(steps)
+        self._notify()
+
+    async def async_hand_back(self) -> None:
+        """Stop stepping and put the room's TRVs into self-regulation, once."""
+        await _async_wait(self._stop_stepping())
+        if self.room is not None:
+            await self.room.hand_back()
+            self._notify()
+
+    def _stop_stepping(self) -> set[asyncio.Task[None]]:
+        """Drop the timer and listeners and cancel the steps; return those."""
+        self._stopped = True
         for unsubscribe in self._unsubscribes:
             unsubscribe()
         self._unsubscribes = []
-        if self._step_tasks:
-            steps = set(self._step_tasks)
-            for step in steps:
-                step.cancel()
-            # wait() rather than gathering, so the steps' cancellation is not
-            # mistaken for this task's own, which a timeout relies on.
-            await asyncio.wait(steps)
-        if self.room is None:
-            return
-        try:
-            await self.room.hand_back()
-        finally:
-            # The room is stopped even when the shutdown bound cuts this off.
-            self._notify()
+        # Cancelling releases the room's lock to whatever waits next.
+        steps = set(self._step_tasks)
+        for step in steps:
+            step.cancel()
+        return steps
 
     @callback
     def _periodic_step(self, _now: datetime) -> None:
@@ -275,7 +285,7 @@ class RoomRuntime:
     @callback
     def _schedule_step(self, condition: StepCondition | None) -> None:
         """Run a step as a task of the entry, which unloading cancels."""
-        if self._handing_back:
+        if self._stopped:
             return
         task = self._entry.async_create_background_task(
             self._hass, self._async_step(condition), f"{DOMAIN} {self.name} step"
@@ -305,18 +315,8 @@ class RoomRuntime:
             listener()
 
 
-async def async_hand_back_all(rooms: Iterable[RoomRuntime]) -> None:
-    """Hand every room back at once."""
-    await asyncio.gather(*(room.async_hand_back() for room in rooms))
-
-
-async def async_hand_back_all_at_stop(rooms: Iterable[RoomRuntime]) -> None:
-    """Hand every room back at once, bounded by HAND_BACK_TIMEOUT."""
-    try:
-        async with asyncio.timeout(HAND_BACK_TIMEOUT):
-            await async_hand_back_all(rooms)
-    except TimeoutError:
-        _LOGGER.warning(
-            "Handing the TRVs back took over %s s; the rest were cut off",
-            HAND_BACK_TIMEOUT,
-        )
+async def _async_wait(steps: set[asyncio.Task[None]]) -> None:
+    # wait() rather than gathering, which would raise the steps' cancellation
+    # in this task.
+    if steps:
+        await asyncio.wait(steps)
