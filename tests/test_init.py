@@ -447,6 +447,27 @@ async def test_unload_during_a_preset_change_forces_heat(
 
 
 @pytest.mark.usefixtures("zwave_js_flow")
+async def test_unload_past_a_cancelled_hand_back_write(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A hand back write cancelled by a zwave_js reload still ends the unload."""
+    calls: list[TrvCall] = []
+    trvs = await async_setup_spirits(hass, calls)
+    hass.states.async_set(WALL_SENSOR, READING)
+    entry = await async_setup_room(hass)
+    await async_set_room_target(hass, TARGET)
+    trvs[1].cancelled_hvac_mode_writes = 1
+    calls.clear()
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert entry.state is ConfigEntryState.NOT_LOADED
+    assert ("set_temperature", TRVS[0].climate, TARGET) in calls
+    assert f"{TRVS[1].climate}: climate.set_hvac_mode was cancelled" in caplog.text
+
+
+@pytest.mark.usefixtures("zwave_js_flow")
 async def test_target_shows_while_a_step_is_stalled(hass: HomeAssistant) -> None:
     """The thermostat echoes a new target without waiting for a stalled step."""
     calls: list[TrvCall] = []

@@ -111,6 +111,8 @@ class FakeSpiritClimate(ClimateEntity):
         # While set, a preset write is applied only once it is, even if the
         # caller has given up: the node already has the command.
         self.stall_preset: asyncio.Event | None = None
+        # Heat mode writes whose command is cancelled, as on a zwave_js reload.
+        self.cancelled_hvac_mode_writes = 0
         # A preset change not applied yet; the node applies later commands
         # after it, as zwave-js sends a node's commands in order.
         self._pending_preset: asyncio.Task[None] | None = None
@@ -168,6 +170,11 @@ class FakeSpiritClimate(ClimateEntity):
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         self._calls.append(("set_hvac_mode", self.entity_id, hvac_mode))
         await self._after_pending_preset()
+        if self.cancelled_hvac_mode_writes:
+            self.cancelled_hvac_mode_writes -= 1
+            command: asyncio.Future[None] = self.hass.loop.create_future()
+            command.cancel()
+            await command
         if self.stall is not None:
             await self.stall.wait()
         self._attr_hvac_mode = hvac_mode

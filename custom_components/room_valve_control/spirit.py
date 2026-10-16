@@ -493,6 +493,16 @@ class SpiritTrv:
                 SERVICE_TIMEOUT,
             )
             return False
+        except asyncio.CancelledError:
+            # On a disconnect zwave-js-server-python cancels its pending command
+            # futures, which the blocking call awaits in this task.
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+            _LOGGER.warning(
+                "%s: %s.%s was cancelled", self.climate_entity_id, domain, service
+            )
+            return False
         # zwave_js entity methods raise ValueError and KeyError for values the
         # node does not offer in its current mode.
         except (HomeAssistantError, vol.Invalid, ValueError, KeyError) as err:
