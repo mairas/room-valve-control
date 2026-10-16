@@ -58,7 +58,6 @@ ADAPTER_SERVICES: Final = (
     ("climate", "set_hvac_mode"),
     ("climate", "set_temperature"),
     ("number", "set_value"),
-    (ZWAVE_JS, "set_config_parameter"),
 )
 
 
@@ -588,12 +587,24 @@ async def test_set_offset_clamps_and_rounds(
 
     assert await trv.set_offset(offset)
     assert [(c.domain, c.service, dict(c.data)) for c in calls] == [
-        (
-            ZWAVE_JS,
-            "set_config_parameter",
-            {"entity_id": CLIMATE_ID, "parameter": 8, "value": tenths},
-        )
+        ("number", "set_value", {"entity_id": OFFSET_ID, "value": tenths})
     ]
+
+
+@pytest.mark.usefixtures("full_spirit")
+@pytest.mark.parametrize("offset_state", [STATE_UNAVAILABLE, None])
+async def test_set_offset_needs_offset_entity_state(
+    hass: HomeAssistant, calls: list[ServiceCall], offset_state: str | None
+) -> None:
+    """An offset number HA would skip as unavailable gets no write."""
+    if offset_state is None:
+        hass.states.async_remove(OFFSET_ID)
+    else:
+        hass.states.async_set(OFFSET_ID, offset_state)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+
+    assert not await trv.set_offset(1.0)
+    assert calls == []
 
 
 @pytest.mark.usefixtures("full_spirit")
@@ -646,7 +657,7 @@ async def test_failed_service_reports_not_sent(
     assert not await trv.set_valve(50)
     assert not await trv.set_offset(1.0)
     assert "set_preset_mode failed" in caplog.text
-    assert "set_config_parameter failed" in caplog.text
+    assert caplog.text.count("number.set_value failed") == 2  # noqa: PLR2004
 
 
 def failing_valve_writes(hass: HomeAssistant, calls: list[ServiceCall]) -> None:
