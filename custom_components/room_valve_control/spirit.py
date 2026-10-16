@@ -86,6 +86,15 @@ class SpiritEntity(StrEnum):
     TEMPERATURE_OFFSET = "temperature_offset"
 
 
+class _Outcome(StrEnum):
+    """What became of a write."""
+
+    SENT = "sent"
+    NOT_SENT = "not_sent"
+    # Timed out or cancelled by zwave_js: the node may still get the command.
+    UNKNOWN = "unknown"
+
+
 class SpiritEntityError(Exception):
     """A Spirit TRV entity the adapter needs is missing, disabled or deviceless."""
 
@@ -437,18 +446,26 @@ class SpiritTrv:
         current = self._number_state(self.offset_entity_id)
         if current is not None and round(current) == tenths:
             return False
-        temperature = self._climate_attribute(ATTR_CURRENT_TEMPERATURE)
+        # Gated before the write, which may reach the node even when its
+        # outcome is unknown. Only a write not sent restores the earlier gate.
+        earlier_gate = (self._offset_written_at, self._temperature_at_offset_write)
+        self._offset_written_at = dt_util.utcnow()
+        self._temperature_at_offset_write = self._climate_attribute(
+            ATTR_CURRENT_TEMPERATURE
+        )
         # Not zwave_js.set_config_parameter: its handler gathers the command
         # with return_exceptions, so a cancelled command surfaces as TypeError.
-        sent = await self._call(
+        outcome = await self._send(
             NUMBER_DOMAIN,
             SERVICE_SET_VALUE,
             {ATTR_ENTITY_ID: self.offset_entity_id, ATTR_VALUE: tenths},
         )
-        if sent:
+        if outcome is _Outcome.NOT_SENT:
+            self._offset_written_at, self._temperature_at_offset_write = earlier_gate
+        else:
+            # Reports during the write may predate the node applying it.
             self._offset_written_at = dt_util.utcnow()
-            self._temperature_at_offset_write = temperature
-        return sent
+        return outcome is _Outcome.SENT
 
     def _climate_attribute(self, attribute: str) -> float | None:
         state = self._hass.states.get(self.climate_entity_id)
@@ -467,8 +484,13 @@ class SpiritTrv:
             return None
 
     async def _call(self, domain: str, service: str, data: dict[str, object]) -> bool:
+        return await self._send(domain, service, data) is _Outcome.SENT
+
+    async def _send(
+        self, domain: str, service: str, data: dict[str, object]
+    ) -> _Outcome:
         if not self.available:
-            return False
+            return _Outcome.NOT_SENT
         if not self._dead_node_write_allowed():
             _LOGGER.debug(
                 "%s: node is dead; write dropped: %s.%s",
@@ -476,7 +498,7 @@ class SpiritTrv:
                 domain,
                 service,
             )
-            return False
+            return _Outcome.NOT_SENT
         try:
             async with asyncio.timeout(SERVICE_TIMEOUT):
                 await self._hass.services.async_call(
@@ -490,7 +512,7 @@ class SpiritTrv:
                 service,
                 SERVICE_TIMEOUT,
             )
-            return False
+            return _Outcome.UNKNOWN
         except asyncio.CancelledError:
             # On a disconnect zwave-js-server-python cancels its pending command
             # futures, which the blocking call awaits in this task.
@@ -500,13 +522,13 @@ class SpiritTrv:
             _LOGGER.warning(
                 "%s: %s.%s was cancelled", self.climate_entity_id, domain, service
             )
-            return False
+            return _Outcome.UNKNOWN
         # zwave_js entity methods raise ValueError and KeyError for values the
         # node does not offer in its current mode.
         except (HomeAssistantError, vol.Invalid, ValueError, KeyError) as err:
             _LOGGER.warning(
                 "%s: %s.%s failed: %s", self.climate_entity_id, domain, service, err
             )
-            return False
+            return _Outcome.NOT_SENT
         self._dead_node_write_at = None
-        return True
+        return _Outcome.SENT
