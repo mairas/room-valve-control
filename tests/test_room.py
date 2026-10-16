@@ -660,6 +660,44 @@ async def test_stopped_room_writes_nothing() -> None:
     assert not room.needs_immediate_step(at(120), fresh(20.0, at(120)))
 
 
+async def test_stop_ends_the_room_without_writing() -> None:
+    """A stopped room leaves its TRVs as they are, and records later targets."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+
+    await room.stop()
+    await room.step(at(15), fresh(20.0, at(15)))
+    await room.set_target(OTHER_TARGET)
+    await room.hand_back()
+
+    assert trv.calls == []
+    assert room.control_mode is ControlMode.STOPPED
+    assert room.target == OTHER_TARGET
+
+
+async def test_stop_waits_for_a_fallback_target_write() -> None:
+    """A target write in progress finishes first; one queued after writes nothing."""
+    trv = FakeTrv(mode=TrvMode.SELF_REGULATING, setpoint=TARGET)
+    room = make_room([trv])
+    await room.set_target(TARGET)
+    await go_fallback(room, trv, now=at(2 * STALE_TIMEOUT.total_seconds() / 60))
+    gate = close_gates(trv)
+    first = asyncio.create_task(room.set_target(OTHER_TARGET))
+    await trv.suspended.wait()
+
+    stop = asyncio.create_task(room.stop())
+    later = asyncio.create_task(room.set_target(LATEST_TARGET))
+    await settle()
+    assert not stop.done()
+    gate.set()
+    await asyncio.gather(first, stop, later)
+
+    assert trv.calls == [("setpoint", OTHER_TARGET)]
+    assert room.control_mode is ControlMode.STOPPED
+    assert room.target == LATEST_TARGET
+
+
 async def test_target_set_during_hand_back_is_recorded_not_written() -> None:
     """A target arriving while the TRVs are handed back waits for nothing."""
     trv = FakeTrv(valve=0.0)
