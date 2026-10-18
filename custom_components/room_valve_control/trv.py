@@ -1,7 +1,10 @@
 """The device-facing interface a room uses to drive its TRVs."""
 
 from enum import StrEnum
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 
 class TrvMode(StrEnum):
@@ -46,6 +49,21 @@ class Trv(Protocol):
     @property
     def setpoint(self) -> float | None:
         """Return the self-regulation setpoint in °C."""
+        ...
+
+    @property
+    def external_setpoint(self) -> float | None:
+        """
+        Return a self-regulation setpoint set on the device itself.
+
+        None unless the TRV self-regulates at a setpoint other than the one
+        enter_self_regulation last asked for, once that write has read back.
+        """
+        ...
+
+    @property
+    def updated(self) -> datetime | None:
+        """Return when the device last reported a change."""
         ...
 
     @property

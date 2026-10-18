@@ -53,6 +53,8 @@ class FakeTrv:
         available: bool = True,
         mode: TrvMode = TrvMode.SELF_REGULATING,
         setpoint: float | None = None,
+        external_setpoint: float | None = None,
+        updated: datetime | None = None,
         valve: float | None = None,
         own_temperature: float | None = None,
         offset: float | None = None,
@@ -65,6 +67,8 @@ class FakeTrv:
         self.available = available
         self.mode = mode
         self.setpoint = setpoint
+        self.external_setpoint = external_setpoint
+        self.updated = updated
         self.valve = valve
         self.own_temperature = own_temperature
         self.offset = offset

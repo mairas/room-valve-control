@@ -172,6 +172,11 @@ class SpiritTrv:
         """Find the TRV's entities; raise SpiritEntityError if one is unusable."""
         self._hass = hass
         self._setpoint_pending = False
+        # The setpoint the last self-regulation call asked for, None after a
+        # mode change until it does, and what the TRV reported when that
+        # setpoint was written, until the write reads back.
+        self._wanted_setpoint: float | None = None
+        self._setpoint_before_write: float | None = None
         # When the last offset write went out, and the temperature then reported.
         self._offset_written_at: datetime | None = None
         self._temperature_at_offset_write: float | None = None
@@ -302,6 +307,38 @@ class SpiritTrv:
         return self._climate_attribute(ATTR_TEMPERATURE)
 
     @property
+    def external_setpoint(self) -> float | None:
+        """
+        Return a setpoint set on the TRV itself, None if there is none.
+
+        That is the setpoint of a self-regulating TRV other than the one last
+        asked for, and other than the one it reported when that was written,
+        until the write reads back: the Spirit may report the old one for a
+        while.
+        """
+        wanted = self._wanted_setpoint
+        reported = self.setpoint
+        if (
+            wanted is None
+            or reported is None
+            or self.mode is not TrvMode.SELF_REGULATING
+        ):
+            return None
+        if self._setpoint_matches(wanted):
+            self._setpoint_before_write = None
+            return None
+        before = self._setpoint_before_write
+        if before is not None and self._setpoint_matches(before):
+            return None
+        return reported
+
+    @property
+    def updated(self) -> datetime | None:
+        """Return when the climate state last changed."""
+        state = self._hass.states.get(self.climate_entity_id)
+        return None if state is None else state.last_updated
+
+    @property
     def valve(self) -> float | None:
         """Return the valve number's state in %."""
         return self._number_state(self.valve_entity_id)
@@ -342,6 +379,7 @@ class SpiritTrv:
 
     async def enter_direct(self) -> bool:
         """Select the Manufacturer specific preset."""
+        self._wanted_setpoint = None
         return await self._call(
             CLIMATE_DOMAIN,
             SERVICE_SET_PRESET_MODE,
@@ -376,6 +414,7 @@ class SpiritTrv:
                 return sent
             sent += 1
             self._setpoint_pending = True
+            self._wanted_setpoint = None
             if not await self._wait_for_self_regulation():
                 _LOGGER.info(
                     "%s: heat mode not reported within %s s; setpoint deferred",
@@ -383,9 +422,12 @@ class SpiritTrv:
                     MODE_CHANGE_TIMEOUT,
                 )
                 return sent
-        if (
-            self._setpoint_pending or not self._setpoint_matches(setpoint)
-        ) and await self._call(
+        self._wanted_setpoint = setpoint
+        if not self._setpoint_pending and self._setpoint_matches(setpoint):
+            self._setpoint_before_write = None
+            return sent
+        self._setpoint_before_write = self.setpoint
+        if await self._call(
             CLIMATE_DOMAIN,
             SERVICE_SET_TEMPERATURE,
             {ATTR_ENTITY_ID: self.climate_entity_id, ATTR_TEMPERATURE: setpoint},

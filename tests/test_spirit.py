@@ -558,6 +558,143 @@ async def test_enter_direct_sets_manufacturer_preset(
     ]
 
 
+@pytest.mark.usefixtures("full_spirit", "calls")
+async def test_external_setpoint_none_before_self_regulation(
+    hass: HomeAssistant,
+) -> None:
+    """A setpoint the room never asked for is not an external change."""
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    set_climate(hass, "heat", setpoint=22.5)
+
+    assert trv.external_setpoint is None
+
+
+@pytest.mark.usefixtures("full_spirit", "calls")
+async def test_external_setpoint_differs_from_the_written_one(
+    hass: HomeAssistant,
+) -> None:
+    """A setpoint other than the one last asked for is reported."""
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    await trv.enter_self_regulation(21.0)
+    assert trv.external_setpoint is None
+
+    set_climate(hass, "heat", setpoint=22.5)
+
+    assert trv.external_setpoint == pytest.approx(22.5)
+
+
+@pytest.mark.usefixtures("full_spirit", "calls")
+async def test_external_setpoint_within_half_a_step_is_none(
+    hass: HomeAssistant,
+) -> None:
+    """The TRV rounding the written setpoint to its step is not a change."""
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    await trv.enter_self_regulation(21.3)
+    set_climate(hass, "heat", setpoint=21.5)
+
+    assert trv.external_setpoint is None
+
+
+@pytest.mark.usefixtures("full_spirit")
+async def test_external_setpoint_ignores_a_write_not_read_back(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """
+    The setpoint from before a write is not reported until the write reads back.
+
+    Any other setpoint is; once the write has read back, so is the old one.
+    """
+    set_climate(hass, "heat", setpoint=20.0)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+
+    assert await trv.enter_self_regulation(21.0) == 1
+    assert [c.service for c in calls] == ["set_temperature"]
+    assert trv.external_setpoint is None
+
+    set_climate(hass, "heat", setpoint=21.0)
+    assert trv.external_setpoint is None
+    set_climate(hass, "heat", setpoint=20.0)
+    assert trv.external_setpoint == pytest.approx(20.0)
+
+
+@pytest.mark.usefixtures("full_spirit", "calls")
+async def test_external_setpoint_during_a_write_not_read_back(
+    hass: HomeAssistant,
+) -> None:
+    """A setpoint neither from before nor of the write is reported at once."""
+    set_climate(hass, "heat", setpoint=20.0)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    await trv.enter_self_regulation(21.0)
+
+    set_climate(hass, "heat", setpoint=22.0)
+
+    assert trv.external_setpoint == pytest.approx(22.0)
+
+
+@pytest.mark.usefixtures("full_spirit", "short_mode_change_timeout")
+async def test_external_setpoint_none_while_the_setpoint_is_deferred(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """The setpoint a TRV leaves mode 31 with is not an external change."""
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    set_climate(hass, STATE_UNKNOWN, preset=DIRECT_MODE_PRESET, setpoint=None)
+    assert await trv.enter_self_regulation(21.0) == 1
+    assert [c.service for c in calls] == ["set_hvac_mode"]
+
+    set_climate(hass, "heat", setpoint=19.5)
+
+    assert trv.external_setpoint is None
+
+
+@pytest.mark.usefixtures("full_spirit", "calls")
+async def test_external_setpoint_none_after_entering_direct(
+    hass: HomeAssistant,
+) -> None:
+    """A TRV the room put in direct mode has no fallback setpoint to differ from."""
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    await trv.enter_self_regulation(21.0)
+    await trv.enter_direct()
+
+    set_climate(hass, "heat", setpoint=22.5)
+
+    assert trv.external_setpoint is None
+
+
+@pytest.mark.usefixtures("full_spirit", "calls")
+@pytest.mark.parametrize(
+    ("state", "setpoint"),
+    [("off", 22.5), ("heat", None), (STATE_UNAVAILABLE, 22.5)],
+)
+async def test_external_setpoint_needs_self_regulation_and_a_setpoint(
+    hass: HomeAssistant, state: str, setpoint: float | None
+) -> None:
+    """Off, a missing setpoint or an unavailable TRV reports no change."""
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    await trv.enter_self_regulation(21.0)
+
+    set_climate(hass, state, setpoint=setpoint)
+
+    assert trv.external_setpoint is None
+
+
+async def test_updated_is_climate_last_updated(
+    hass: HomeAssistant, full_spirit: Spirit, freezer: FrozenDateTimeFactory
+) -> None:
+    """The TRV was last updated when its climate state last changed."""
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    freezer.tick(timedelta(minutes=5))
+    set_climate(hass, "heat", setpoint=22.0)
+
+    state = hass.states.get(CLIMATE_ID)
+    assert state is not None
+    assert trv.updated == state.last_updated
+
+    full_spirit.entity_registry.async_update_entity(
+        CLIMATE_ID, new_entity_id="climate.renamed"
+    )
+    assert trv.updated is None
+
+
 @pytest.mark.usefixtures("full_spirit")
 async def test_set_valve_writes_number(
     hass: HomeAssistant, calls: list[ServiceCall]
