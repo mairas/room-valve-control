@@ -6,7 +6,12 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Final
 
 import pytest
-from homeassistant.const import EVENT_STATE_CHANGED, STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.const import (
+    ATTR_TEMPERATURE,
+    EVENT_STATE_CHANGED,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+)
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 
@@ -539,6 +544,33 @@ async def test_setpoint_matches_within_half_a_step(
 
     assert await trv.enter_self_regulation(requested) == int(written)
     assert len(calls) == int(written)
+
+
+@pytest.mark.usefixtures("full_spirit")
+@pytest.mark.parametrize(
+    ("requested", "step", "written"),
+    [
+        (21.3, None, 21.5),
+        (21.7, None, 21.5),
+        (21.25, None, 21.5),
+        (21.75, None, 22.0),
+        (21.3, 0.1, 21.3),
+        (21.34, 0.1, 21.3),
+    ],
+)
+async def test_setpoint_is_written_on_the_step(
+    hass: HomeAssistant,
+    calls: list[ServiceCall],
+    requested: float,
+    step: float | None,
+    written: float,
+) -> None:
+    """The setpoint written is the nearest step, a half step rounding up."""
+    set_climate(hass, "heat", setpoint=19.0, step=step)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+
+    assert await trv.enter_self_regulation(requested) == 1
+    assert [c.data[ATTR_TEMPERATURE] for c in calls] == [pytest.approx(written)]
 
 
 @pytest.mark.usefixtures("full_spirit")

@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 from datetime import timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final
@@ -72,6 +73,9 @@ MODE_CHANGE_TIMEOUT: Final = 10.0
 
 # zwave_js reports no target_temp_step for the Spirit; its setpoint is in 0.5 °C.
 DEFAULT_SETPOINT_STEP: Final = 0.5
+# Decimals a snapped setpoint is rounded to, dropping the float error of the
+# step multiplication; finer than any step a TRV uses.
+SETPOINT_DECIMALS: Final = 2
 
 # Parameter 8 is in tenths of a °C, -50…50.
 OFFSET_TENTHS_PER_DEGREE: Final = 10
@@ -395,12 +399,16 @@ class SpiritTrv:
         """
         Set heat mode, then the setpoint, skipping what already matches.
 
+        The setpoint is snapped to the TRV's step, a half step rounding up, so
+        that the TRV reports back exactly what was written.
+
         After a mode change the setpoint is written only once heat mode reads
         back, and then without comparing: the reported setpoint is the one
         from before. If heat mode does not read back in time, the setpoint is
         left to the next call. With force_mode the mode is written whatever
         the TRV reports.
         """
+        setpoint = self._on_step(setpoint)
         sent = 0
         if force_mode or self.mode is not TrvMode.SELF_REGULATING:
             if not await self._call(
@@ -436,10 +444,19 @@ class SpiritTrv:
             sent += 1
         return sent
 
+    def _setpoint_step(self) -> float:
+        return self._climate_attribute(ATTR_TARGET_TEMP_STEP) or DEFAULT_SETPOINT_STEP
+
+    def _on_step(self, setpoint: float) -> float:
+        step = self._setpoint_step()
+        return round(math.floor(setpoint / step + 0.5) * step, SETPOINT_DECIMALS)
+
     def _setpoint_matches(self, setpoint: float) -> bool:
         reported = self.setpoint
-        step = self._climate_attribute(ATTR_TARGET_TEMP_STEP) or DEFAULT_SETPOINT_STEP
-        return reported is not None and abs(reported - setpoint) < step / 2
+        return (
+            reported is not None
+            and abs(reported - setpoint) < self._setpoint_step() / 2
+        )
 
     async def _wait_for_self_regulation(self) -> bool:
         if self.mode is TrvMode.SELF_REGULATING:
