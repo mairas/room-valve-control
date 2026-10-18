@@ -801,12 +801,24 @@ async def test_write_not_sent_is_not_awaited(
     assert listening.pressed == Press(20.0, pressed_at)
 
 
-async def test_entering_direct_drops_unconfirmed_writes(
-    hass: HomeAssistant, freezer: FrozenDateTimeFactory, listening: SpiritTrv
+async def test_mode_31_report_drops_unconfirmed_writes(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    listening: SpiritTrv,
 ) -> None:
-    """A press to a value a fallback write left unconfirmed is a press."""
-    assert await listening.enter_self_regulation(22.0) == 1
+    """
+    A write still unconfirmed when the room enters direct mode reads back.
+
+    The node gets its commands in order, so by the time it reports mode 31
+    the write has landed or failed: a press to its value is then a press.
+    """
+    unknown_setpoint_writes(hass, freezer, monkeypatch, "timed out")
+    assert await listening.enter_self_regulation(22.0) == 0
     assert await listening.enter_direct()
+
+    report(hass, freezer, 22.0)
+    assert listening.pressed is None
 
     leave_direct(hass, freezer)
     pressed_at = report(hass, freezer, 22.0)

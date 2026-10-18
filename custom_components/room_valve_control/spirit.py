@@ -351,9 +351,9 @@ class SpiritTrv:
         Record presses from the climate entity's reports, once.
 
         A press is a setpoint change between two heat reports that is not the
-        read-back of a setpoint written since the last one confirmed. Entering
-        heat, from mode 31 or anything else, carries the stored setpoint, so
-        it is never a press.
+        read-back of a setpoint written since the last one confirmed or the
+        last mode 31 report. Entering heat, from mode 31 or anything else,
+        carries the stored setpoint, so it is never a press.
         """
         if self._unsubscribes:
             return
@@ -386,6 +386,10 @@ class SpiritTrv:
     @callback
     def _async_climate_changed(self, event: Event[EventStateChangedData]) -> None:
         old, new = event.data["old_state"], event.data["new_state"]
+        if new is not None and _state_mode(new) is TrvMode.DIRECT:
+            # The node gets its commands in order: every earlier write has
+            # landed or failed by the time it reports mode 31.
+            self._unconfirmed_setpoints.clear()
         if (
             old is None
             or new is None
@@ -444,7 +448,6 @@ class SpiritTrv:
 
     async def enter_direct(self) -> bool:
         """Select the Manufacturer specific preset."""
-        self._unconfirmed_setpoints.clear()
         return await self._call(
             CLIMATE_DOMAIN,
             SERVICE_SET_PRESET_MODE,
