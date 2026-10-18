@@ -899,6 +899,25 @@ async def test_mode_31_report_drops_writes_that_never_landed(
     assert listening.pressed == Press(22.0, pressed_at)
 
 
+async def test_repeated_write_reads_back_once(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    listening: SpiritTrv,
+) -> None:
+    """A write retried while unconfirmed is confirmed by its one read-back."""
+    unknown_setpoint_writes(hass, freezer, monkeypatch, "timed out")
+    assert await listening.enter_self_regulation(22.0) == 0
+    assert await listening.enter_self_regulation(22.0) == 0
+
+    report(hass, freezer, 22.0)
+    report(hass, freezer, 20.5)
+    listening.clear_press()
+    pressed_at = report(hass, freezer, 22.0)
+
+    assert listening.pressed == Press(22.0, pressed_at)
+
+
 async def test_presses_are_recorded_only_while_listening(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory, listening: SpiritTrv
 ) -> None:

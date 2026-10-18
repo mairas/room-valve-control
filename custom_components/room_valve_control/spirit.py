@@ -418,6 +418,10 @@ class SpiritTrv:
         )
         if read_back is not None:
             del unconfirmed[: read_back + 1]
+            # A retry of the value just read back changes nothing on the TRV,
+            # so it never reports.
+            while unconfirmed and _same_setpoint(setpoint, unconfirmed[0]):
+                del unconfirmed[0]
             return
         self._pressed = Press(setpoint, new.last_updated)
 
