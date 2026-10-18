@@ -58,7 +58,6 @@ ADAPTER_SERVICES: Final = (
     ("climate", "set_hvac_mode"),
     ("climate", "set_temperature"),
     ("number", "set_value"),
-    (ZWAVE_JS, "set_config_parameter"),
 )
 
 
@@ -588,12 +587,24 @@ async def test_set_offset_clamps_and_rounds(
 
     assert await trv.set_offset(offset)
     assert [(c.domain, c.service, dict(c.data)) for c in calls] == [
-        (
-            ZWAVE_JS,
-            "set_config_parameter",
-            {"entity_id": CLIMATE_ID, "parameter": 8, "value": tenths},
-        )
+        ("number", "set_value", {"entity_id": OFFSET_ID, "value": tenths})
     ]
+
+
+@pytest.mark.usefixtures("full_spirit")
+@pytest.mark.parametrize("offset_state", [STATE_UNAVAILABLE, None])
+async def test_set_offset_needs_offset_entity_state(
+    hass: HomeAssistant, calls: list[ServiceCall], offset_state: str | None
+) -> None:
+    """An offset number HA would skip as unavailable gets no write."""
+    if offset_state is None:
+        hass.states.async_remove(OFFSET_ID)
+    else:
+        hass.states.async_set(OFFSET_ID, offset_state)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+
+    assert not await trv.set_offset(1.0)
+    assert calls == []
 
 
 @pytest.mark.usefixtures("full_spirit")
@@ -646,7 +657,7 @@ async def test_failed_service_reports_not_sent(
     assert not await trv.set_valve(50)
     assert not await trv.set_offset(1.0)
     assert "set_preset_mode failed" in caplog.text
-    assert "set_config_parameter failed" in caplog.text
+    assert caplog.text.count("number.set_value failed") == 2  # noqa: PLR2004
 
 
 def failing_valve_writes(hass: HomeAssistant, calls: list[ServiceCall]) -> None:
@@ -791,6 +802,84 @@ async def test_stalled_service_times_out(
 
     assert not await trv.set_valve(50)
     assert "set_value timed out" in caplog.text
+
+
+async def cancelled_command(_call: ServiceCall) -> None:
+    """Await a command future that is cancelled, as on a zwave_js disconnect."""
+    command: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    asyncio.get_running_loop().call_soon(command.cancel)
+    await command
+
+
+@pytest.mark.usefixtures("full_spirit")
+async def test_cancelled_command_reports_not_sent(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A command cancelled under a task nobody cancelled is a failed write."""
+    attempted: list[str] = []
+
+    async def cancelled(call: ServiceCall) -> None:
+        attempted.append(call.service)
+        await cancelled_command(call)
+
+    for domain, service in ADAPTER_SERVICES:
+        hass.services.async_register(domain, service, cancelled)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    set_climate(hass, STATE_UNKNOWN, preset=DIRECT_MODE_PRESET, setpoint=None)
+
+    assert not await trv.enter_direct()
+    assert await trv.enter_self_regulation(20.0) == 0
+    assert not await trv.set_valve(50)
+    assert not await trv.set_offset(1.0)
+    # A failed mode write leaves the setpoint unsent.
+    assert "set_temperature" not in attempted
+    for domain, service in ADAPTER_SERVICES:
+        if service in attempted:
+            assert f"{CLIMATE_ID}: {domain}.{service} was cancelled" in caplog.text
+
+
+@pytest.mark.usefixtures("full_spirit")
+async def test_cancelling_the_caller_still_cancels(hass: HomeAssistant) -> None:
+    """Cancelling the task that writes propagates out of the write."""
+    started = asyncio.Event()
+
+    async def stall(_call: ServiceCall) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    hass.services.async_register("number", "set_value", stall)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    write = asyncio.create_task(trv.set_valve(50))
+    await started.wait()
+
+    write.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await write
+
+
+@pytest.mark.usefixtures("full_spirit")
+async def test_caller_cancelled_during_cancelled_command_still_cancels(
+    hass: HomeAssistant,
+) -> None:
+    """A caller cancelled just after zwave_js cancels its command propagates."""
+    write: asyncio.Task[bool] | None = None
+    command: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    async def cancel_both(_call: ServiceCall) -> None:
+        assert write is not None
+        loop = asyncio.get_running_loop()
+        loop.call_soon(command.cancel)
+        loop.call_soon(write.cancel)
+        await command
+
+    hass.services.async_register("number", "set_value", cancel_both)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    write = asyncio.create_task(trv.set_valve(50))
+
+    with pytest.raises(asyncio.CancelledError):
+        await write
+    assert command.cancelled()
 
 
 @pytest.mark.usefixtures("full_spirit")
