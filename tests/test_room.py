@@ -88,6 +88,7 @@ class FakeTrv:
 
     async def enter_direct(self) -> bool:
         """Record the mode write."""
+        self.external_setpoint = None
         self.calls.append(("direct",))
         await self._wait_for_gate()
         if self.sends:
@@ -98,6 +99,7 @@ class FakeTrv:
         self, setpoint: float, *, force_mode: bool = False
     ) -> int:
         """Record heat mode, then setpoint, writing only what differs unless forced."""
+        self.external_setpoint = None
         sent = 0
         if force_mode or self.mode is not TrvMode.SELF_REGULATING:
             self.calls.append(("heat",))
@@ -466,6 +468,213 @@ async def test_trv_back_from_unavailable_in_self_regulation(
 
     assert trv.calls[0] == ("direct",)
     assert len(warnings(caplog)) == (1 if directed else 0)
+
+
+def infos(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return the messages captured at info level."""
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+
+
+def press(trv: FakeTrv, setpoint: float, minutes: float = 10) -> None:
+    """Set the TRV's setpoint by hand, which leaves direct mode, at minutes."""
+    trv.mode = TrvMode.SELF_REGULATING
+    trv.setpoint = setpoint
+    trv.updated = at(minutes)
+
+
+def press_in_fallback(trv: FakeTrv, setpoint: float, minutes: float = 100) -> None:
+    """Set a self-regulating TRV's setpoint by hand at minutes."""
+    press(trv, setpoint, minutes)
+    trv.external_setpoint = setpoint
+
+
+async def test_setpoint_set_on_a_direct_trv_becomes_the_target(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The room adopts it, puts the TRV back in direct mode and steps against it."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    press(trv, OTHER_TARGET)
+
+    with caplog.at_level(logging.INFO):
+        await room.step(at(15), fresh(20.0, at(15)))
+
+    assert room.target == OTHER_TARGET
+    assert room.last_error == pytest.approx(OTHER_TARGET - 20.0)
+    assert trv.calls[0] == ("direct",)
+    assert room.control_mode is ControlMode.DIRECT
+    assert warnings(caplog) == []
+    assert infos(caplog) == [f"living room: target {OTHER_TARGET} from climate.trv"]
+
+
+async def test_direct_trv_switched_out_by_the_room_is_not_adopted() -> None:
+    """The setpoint a fallback wrote is the room's own on the return to direct."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    await go_fallback(room, trv, now=at(90))
+    trv.updated = at(95)
+
+    await room.step(at(105), fresh(20.0, at(105)))
+
+    assert room.target == TARGET
+    assert trv.calls[0] == ("direct",)
+
+
+@pytest.mark.parametrize("mode", [TrvMode.UNKNOWN, TrvMode.SELF_REGULATING])
+async def test_direct_trv_out_without_a_heat_setpoint_is_not_adopted(
+    caplog: pytest.LogCaptureFixture, mode: TrvMode
+) -> None:
+    """A TRV off, or self-regulating without a setpoint, is only re-entered."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    trv.mode = mode
+    trv.setpoint = None if mode is TrvMode.SELF_REGULATING else OTHER_TARGET
+
+    with caplog.at_level(logging.WARNING):
+        await room.step(at(15), fresh(20.0, at(15)))
+
+    assert room.target == TARGET
+    assert trv.calls[0] == ("direct",)
+    assert len(warnings(caplog)) == 1
+
+
+async def test_self_regulating_trv_never_directed_is_not_adopted() -> None:
+    """A TRV found self-regulating at the first direct step keeps the target."""
+    trv = FakeTrv(setpoint=OTHER_TARGET, updated=START)
+    room = make_room([trv])
+    await room.set_target(TARGET)
+
+    await room.step(START, fresh(20.0, START))
+
+    assert room.target == TARGET
+
+
+async def test_unavailable_direct_trv_is_not_adopted() -> None:
+    """A TRV that cannot be read gives the room no setpoint."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    press(trv, OTHER_TARGET)
+    trv.available = False
+
+    await room.step(at(15), fresh(20.0, at(15)))
+
+    assert room.target == TARGET
+
+
+async def test_fallback_trv_at_the_written_setpoint_is_not_adopted() -> None:
+    """A TRV reporting no setpoint of its own leaves the target as it is."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    await go_fallback(room, trv, now=at(90))
+
+    await room.step(at(105), [])
+
+    assert room.target == TARGET
+    assert trv.calls == []
+
+
+async def test_setpoint_set_on_a_fallback_trv_goes_to_the_others(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The room adopts it and writes it to its other TRVs."""
+    pressed = FakeTrv(name="climate.window", valve=0.0)
+    other = FakeTrv(name="climate.door", valve=0.0)
+    room = make_room([pressed, other])
+    await go_direct(room, pressed, other)
+    await go_fallback(room, pressed, other, now=at(90))
+    press_in_fallback(pressed, OTHER_TARGET)
+
+    with caplog.at_level(logging.INFO):
+        await room.step(at(105), [])
+
+    assert room.target == OTHER_TARGET
+    assert pressed.calls == []
+    assert other.calls == [("setpoint", OTHER_TARGET)]
+    assert infos(caplog) == [f"living room: target {OTHER_TARGET} from climate.window"]
+
+
+async def test_unavailable_fallback_trv_is_not_adopted() -> None:
+    """An unavailable TRV's last setpoint is not taken."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    await go_fallback(room, trv, now=at(90))
+    press_in_fallback(trv, OTHER_TARGET)
+    trv.available = False
+
+    await room.step(at(105), [])
+
+    assert room.target == TARGET
+
+
+async def test_setpoint_set_in_fallback_counts_when_readings_return() -> None:
+    """A step that leaves fallback steps against the adopted target."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    await go_fallback(room, trv, now=at(90))
+    press_in_fallback(trv, OTHER_TARGET)
+
+    await room.step(at(105), fresh(20.0, at(105)))
+
+    assert room.target == OTHER_TARGET
+    assert room.last_error == pytest.approx(OTHER_TARGET - 20.0)
+
+
+@pytest.mark.parametrize("in_fallback", [False, True])
+async def test_most_recently_updated_trv_wins(*, in_fallback: bool) -> None:
+    """Of two TRVs set by hand, the one whose state changed last is adopted."""
+    trvs = [
+        FakeTrv(name="climate.window", valve=0.0),
+        FakeTrv(name="climate.door", valve=0.0),
+        FakeTrv(name="climate.corner", valve=0.0),
+    ]
+    room = make_room(trvs)
+    await go_direct(room, *trvs)
+    set_by_hand = press
+    if in_fallback:
+        await go_fallback(room, *trvs, now=at(90))
+        set_by_hand = press_in_fallback
+    set_by_hand(trvs[0], OTHER_TARGET, minutes=95)
+    set_by_hand(trvs[1], LATEST_TARGET, minutes=100)
+    set_by_hand(trvs[2], 24.0)
+    trvs[2].updated = None
+
+    await room.step(at(105), fresh(20.0, at(105)))
+
+    assert room.target == LATEST_TARGET
+
+
+async def test_room_without_target_adopts_nothing() -> None:
+    """Without a target the room does nothing, a TRV's setpoint included."""
+    trv = FakeTrv(external_setpoint=OTHER_TARGET, updated=START)
+    room = make_room([trv])
+
+    await room.step(START, fresh(20.0, START))
+    await room.step(START + STALE_TIMEOUT + CONTROL_STEP, [])
+
+    assert room.target is None
+    assert trv.calls == []
+
+
+async def test_stopped_room_adopts_nothing() -> None:
+    """After a stop, setpoints set on the TRVs stay theirs."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    await go_fallback(room, trv, now=at(90))
+    await room.stop()
+    press_in_fallback(trv, OTHER_TARGET)
+
+    await room.step(at(105), [])
+
+    assert room.target == TARGET
+    assert trv.calls == []
 
 
 async def test_stale_sensor_is_ignored_when_another_is_fresh() -> None:
