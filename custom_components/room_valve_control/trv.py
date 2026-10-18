@@ -1,5 +1,6 @@
 """The device-facing interface a room uses to drive its TRVs."""
 
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol
 
@@ -13,6 +14,14 @@ class TrvMode(StrEnum):
     DIRECT = "direct"
     SELF_REGULATING = "self_regulating"
     UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class Press:
+    """A setpoint set on the device itself, and when the device reported it."""
+
+    setpoint: float
+    at: datetime
 
 
 # A Protocol rather than an ABC: implementations share no code, and the room's

@@ -24,18 +24,28 @@ from homeassistant.components.number.const import ATTR_VALUE, SERVICE_SET_VALUE
 from homeassistant.components.number.const import DOMAIN as NUMBER_DOMAIN
 from homeassistant.components.sensor.const import DOMAIN as SENSOR_DOMAIN
 from homeassistant.const import ATTR_ENTITY_ID, ATTR_TEMPERATURE, STATE_UNAVAILABLE
-from homeassistant.core import Event, EventStateChangedData, callback
+from homeassistant.core import (
+    CALLBACK_TYPE,
+    Event,
+    EventStateChangedData,
+    State,
+    callback,
+)
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
-from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.event import (
+    async_track_entity_registry_updated_event,
+    async_track_state_change_event,
+)
 from homeassistant.util import dt as dt_util
 
-from .trv import TrvMode
+from .trv import Press, TrvMode
 
 if TYPE_CHECKING:
     from datetime import datetime
 
     from homeassistant.core import HomeAssistant
+    from homeassistant.helpers.entity_registry import EventEntityRegistryUpdatedData
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -76,6 +86,7 @@ DEFAULT_SETPOINT_STEP: Final = 0.5
 # Decimals a snapped setpoint is rounded to, dropping the float error of the
 # step multiplication; finer than any step a TRV uses.
 SETPOINT_DECIMALS: Final = 2
+SETPOINT_TOLERANCE: Final = 10**-SETPOINT_DECIMALS / 2
 
 # Parameter 8 is in tenths of a °C, -50…50.
 OFFSET_TENTHS_PER_DEGREE: Final = 10
@@ -140,6 +151,28 @@ def offset_to_tenths(offset: float) -> int:
     return max(-OFFSET_LIMIT_TENTHS, min(OFFSET_LIMIT_TENTHS, tenths))
 
 
+def _state_mode(state: State) -> TrvMode:
+    """Return direct in mode 31, self-regulating in plain heat, else unknown."""
+    if state.state == STATE_UNAVAILABLE:
+        return TrvMode.UNKNOWN
+    preset = state.attributes.get(ATTR_PRESET_MODE)
+    if preset == DIRECT_MODE_PRESET:
+        return TrvMode.DIRECT
+    # Energy heat and Full power are presets that also read as heat.
+    if state.state == SELF_REGULATION_HVAC_MODE and preset in (None, PRESET_NONE):
+        return TrvMode.SELF_REGULATING
+    return TrvMode.UNKNOWN
+
+
+def _state_setpoint(state: State) -> float | None:
+    value = state.attributes.get(ATTR_TEMPERATURE)
+    return float(value) if isinstance(value, int | float) else None
+
+
+def _same_setpoint(a: float, b: float) -> bool:
+    return math.isclose(a, b, rel_tol=0, abs_tol=SETPOINT_TOLERANCE)
+
+
 def _is_value(entry: er.RegistryEntry, command_class: int, property_: str) -> bool:
     _, _, value_id = entry.unique_id.partition(".")
     parts = value_id.split("-")
@@ -186,6 +219,12 @@ class SpiritTrv:
         self._temperature_at_offset_write: float | None = None
         # When the last write was let through to a node reading dead.
         self._dead_node_write_at: datetime | None = None
+        # The setpoints written since the last one that read back, oldest
+        # first: zwave-js sends a node's commands in order, so a superseded
+        # write may still report before the latest.
+        self._unconfirmed_setpoints: list[float] = []
+        self._pressed: Press | None = None
+        self._unsubscribes: list[CALLBACK_TYPE] = []
         registry = er.async_get(hass)
         climate = _usable(
             SpiritEntity.CLIMATE,
@@ -295,15 +334,7 @@ class SpiritTrv:
     def mode(self) -> TrvMode:
         """Return direct in mode 31, self-regulating in plain heat, else unknown."""
         state = self._hass.states.get(self.climate_entity_id)
-        if state is None or state.state == STATE_UNAVAILABLE:
-            return TrvMode.UNKNOWN
-        preset = state.attributes.get(ATTR_PRESET_MODE)
-        if preset == DIRECT_MODE_PRESET:
-            return TrvMode.DIRECT
-        # Energy heat and Full power are presets that also read as heat.
-        if state.state == SELF_REGULATION_HVAC_MODE and preset in (None, PRESET_NONE):
-            return TrvMode.SELF_REGULATING
-        return TrvMode.UNKNOWN
+        return TrvMode.UNKNOWN if state is None else _state_mode(state)
 
     @property
     def setpoint(self) -> float | None:
@@ -341,6 +372,73 @@ class SpiritTrv:
         """Return when the climate state last changed."""
         state = self._hass.states.get(self.climate_entity_id)
         return None if state is None else state.last_updated
+
+    @property
+    def pressed(self) -> Press | None:
+        """Return the last press recorded while listening, until cleared."""
+        return self._pressed
+
+    def clear_press(self) -> None:
+        """Forget the recorded press."""
+        self._pressed = None
+
+    @callback
+    def start_listening(self) -> None:
+        """
+        Record presses from the climate entity's reports, once.
+
+        A press is a setpoint change between two heat reports that is not the
+        read-back of a setpoint written since the last one confirmed. Entering
+        heat, from mode 31 or anything else, carries the stored setpoint, so
+        it is never a press.
+        """
+        if self._unsubscribes:
+            return
+        entity_id = self.climate_entity_id
+        self._unsubscribes = [
+            async_track_state_change_event(
+                self._hass, entity_id, self._async_climate_changed
+            ),
+            async_track_entity_registry_updated_event(
+                self._hass, entity_id, self._async_climate_registry_updated
+            ),
+        ]
+
+    @callback
+    def stop_listening(self) -> None:
+        """Stop recording presses."""
+        for unsubscribe in self._unsubscribes:
+            unsubscribe()
+        self._unsubscribes = []
+
+    @callback
+    def _async_climate_registry_updated(
+        self, event: Event[EventEntityRegistryUpdatedData]
+    ) -> None:
+        data = event.data
+        if data["action"] == "update" and "entity_id" in data["changes"]:
+            self.stop_listening()
+            self.start_listening()
+
+    @callback
+    def _async_climate_changed(self, event: Event[EventStateChangedData]) -> None:
+        old, new = event.data["old_state"], event.data["new_state"]
+        if (
+            old is None
+            or new is None
+            or _state_mode(old) is not TrvMode.SELF_REGULATING
+            or _state_mode(new) is not TrvMode.SELF_REGULATING
+        ):
+            return
+        before, setpoint = _state_setpoint(old), _state_setpoint(new)
+        if before is None or setpoint is None or setpoint == before:
+            return
+        unconfirmed = self._unconfirmed_setpoints
+        if any(_same_setpoint(setpoint, written) for written in unconfirmed):
+            if _same_setpoint(setpoint, unconfirmed[-1]):
+                unconfirmed.clear()
+            return
+        self._pressed = Press(setpoint, new.last_updated)
 
     @property
     def valve(self) -> float | None:
@@ -384,6 +482,7 @@ class SpiritTrv:
     async def enter_direct(self) -> bool:
         """Select the Manufacturer specific preset."""
         self._wanted_setpoint = None
+        self._unconfirmed_setpoints.clear()
         return await self._call(
             CLIMATE_DOMAIN,
             SERVICE_SET_PRESET_MODE,
@@ -435,13 +534,22 @@ class SpiritTrv:
             self._setpoint_before_write = None
             return sent
         self._setpoint_before_write = self.setpoint
-        if await self._call(
+        # Recorded before the write: the TRV may report it before it returns.
+        self._unconfirmed_setpoints.append(setpoint)
+        outcome = await self._send(
             CLIMATE_DOMAIN,
             SERVICE_SET_TEMPERATURE,
             {ATTR_ENTITY_ID: self.climate_entity_id, ATTR_TEMPERATURE: setpoint},
-        ):
+        )
+        if outcome is _Outcome.NOT_SENT:
+            self._unconfirmed_setpoints.remove(setpoint)
+        elif outcome is _Outcome.SENT:
             self._setpoint_pending = False
             sent += 1
+            # A setpoint the TRV already reports reads back as no change.
+            reported = self.setpoint
+            if reported is not None and _same_setpoint(reported, setpoint):
+                self._unconfirmed_setpoints.clear()
         return sent
 
     def _setpoint_step(self) -> float:
