@@ -61,6 +61,9 @@ PRESSED_SETPOINT: Final = 22.5
 PRESS_DELAY: Final = timedelta(minutes=1)
 # Off the TRVs' own setpoint, so a fallback step writes it.
 FALLBACK_TARGET: Final = 20.5
+# Off the TRVs' 0.5 °C step, which a fallback step writes as ON_STEP_TARGET.
+OFF_STEP_TARGET: Final = 21.3
+ON_STEP_TARGET: Final = 21.5
 STEPS_IN_STARTUP_GRACE: Final = DEFAULT_STALE_TIMEOUT // DEFAULT_CONTROL_STEP - 1
 
 
@@ -305,3 +308,42 @@ async def test_setpoint_set_on_a_fallback_trv_goes_to_the_others(
         PRESSED_SETPOINT,
     )
     assert calls == [("set_temperature", TRVS[1].climate, PRESSED_SETPOINT)]
+
+
+@pytest.mark.usefixtures("zwave_js_flow")
+async def test_target_set_after_a_press_wins(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """A target set on the thermostat after a press is the one the step keeps."""
+    calls: list[TrvCall] = []
+    trvs = await async_setup_spirits(hass, calls)
+    hass.states.async_set(WALL_SENSOR, BELOW_TARGET)
+    await async_setup_room(hass)
+    await async_set_room_target(hass, RESTORED_TARGET)
+
+    freezer.tick(PRESS_DELAY)
+    trvs[0].press(PRESSED_SETPOINT)
+    freezer.tick(PRESS_DELAY)
+    await async_set_room_target(hass, NEXT_TARGET)
+
+    assert await _async_step_targets(hass, freezer) == (NEXT_TARGET, NEXT_TARGET)
+
+
+@pytest.mark.usefixtures("zwave_js_flow")
+async def test_fallback_target_off_the_step_stays_the_target(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """The TRVs get the target on their step; reading that back is no press."""
+    calls: list[TrvCall] = []
+    await async_setup_spirits(hass, calls)
+    hass.states.async_set(WALL_SENSOR, STATE_UNKNOWN)
+    await async_setup_room(hass)
+    await async_set_room_target(hass, OFF_STEP_TARGET)
+    for _ in range(STEPS_IN_STARTUP_GRACE + 1):
+        await async_advance(hass, freezer)
+    assert calls == [("set_temperature", ids.climate, ON_STEP_TARGET) for ids in TRVS]
+
+    assert await _async_step_targets(hass, freezer) == (
+        OFF_STEP_TARGET,
+        OFF_STEP_TARGET,
+    )
