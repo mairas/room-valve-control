@@ -1,5 +1,6 @@
 """Tests for the room thermostat entity."""
 
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
@@ -56,6 +57,8 @@ BELOW_TARGET: Final = "20.0"
 LATER_READING: Final = "20.4"
 NEXT_TARGET: Final = 21.3
 PRESSED_SETPOINT: Final = 22.5
+# A press later than the target change, which a frozen clock does not give.
+PRESS_DELAY: Final = timedelta(minutes=1)
 # Off the TRVs' own setpoint, so a fallback step writes it.
 FALLBACK_TARGET: Final = 20.5
 STEPS_IN_STARTUP_GRACE: Final = DEFAULT_STALE_TIMEOUT // DEFAULT_CONTROL_STEP - 1
@@ -246,17 +249,28 @@ async def _async_step_targets(
 
 
 @pytest.mark.usefixtures("zwave_js_flow")
+@pytest.mark.parametrize("direct_at_start", [False, True])
 async def test_setpoint_set_on_a_direct_trv_becomes_the_target(
-    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    direct_at_start: bool,  # noqa: FBT001
 ) -> None:
-    """A press on a TRV in direct mode is the thermostat's target after the step."""
+    """
+    A press on a TRV in direct mode is the thermostat's target after the step.
+
+    So too after a restart, when the room finds the TRVs in mode 31 already.
+    """
     calls: list[TrvCall] = []
     trvs = await async_setup_spirits(hass, calls)
+    if direct_at_start:
+        for trv in trvs:
+            trv.set_direct()
     hass.states.async_set(WALL_SENSOR, BELOW_TARGET)
     await async_setup_room(hass)
     await async_set_room_target(hass, RESTORED_TARGET)
     calls.clear()
 
+    freezer.tick(PRESS_DELAY)
     trvs[0].press(PRESSED_SETPOINT)
 
     assert await _async_step_targets(hass, freezer) == (

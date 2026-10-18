@@ -29,6 +29,7 @@ from pytest_homeassistant_custom_component.common import (
     mock_restore_cache_with_extra_data,
 )
 
+from custom_components.room_valve_control import UNLOADED_TRVS
 from custom_components.room_valve_control.const import (
     CONF_KP,
     CONF_TRVS,
@@ -349,6 +350,33 @@ async def test_reload_keeps_direct_mode(
     assert mode is not None
     assert mode.state == "direct"
     assert calls == []
+
+
+@pytest.mark.usefixtures("zwave_js_flow")
+async def test_presses_are_heard_across_a_reload_and_not_after_unload(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """The reloaded room adopts a press; an unloaded entry records none."""
+    calls: list[TrvCall] = []
+    trvs = await async_setup_spirits(hass, calls)
+    hass.states.async_set(WALL_SENSOR, READING)
+    entry = await async_setup_room(hass)
+    await async_set_room_target(hass, TARGET)
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    freezer.tick(timedelta(minutes=1))
+    trvs[0].press(OTHER_TARGET)
+    await async_advance(hass, freezer)
+    state = hass.states.get(ROOM_CLIMATE)
+    assert state is not None
+    assert state.attributes[ATTR_TEMPERATURE] == OTHER_TARGET
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    for trv in trvs:
+        trv.press(TARGET)
+    adapters = hass.data[UNLOADED_TRVS][entry.entry_id].values()
+    assert [adapter.pressed for adapter in adapters] == [None, None]
 
 
 async def test_adding_a_room_leaves_the_other_rooms_trvs_alone(

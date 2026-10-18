@@ -61,18 +61,18 @@ class Trv(Protocol):
         ...
 
     @property
-    def external_setpoint(self) -> float | None:
+    def pressed(self) -> Press | None:
         """
-        Return a self-regulation setpoint set on the device itself.
+        Return the latest setpoint set on the device itself, until cleared.
 
-        None unless the TRV self-regulates at a setpoint other than the one
-        enter_self_regulation last asked for, once that write has read back.
+        A press is a change of the self-regulation setpoint made on the
+        device: not the setpoint it enters self-regulation with, and not the
+        read-back of one enter_self_regulation wrote. None when there is none.
         """
         ...
 
-    @property
-    def updated(self) -> datetime | None:
-        """Return when the device last reported a change."""
+    def clear_press(self) -> None:
+        """Forget the press, so that pressed is None until the next one."""
         ...
 
     @property
@@ -104,9 +104,10 @@ class Trv(Protocol):
         """
         Switch to self-regulation at setpoint; return the writes sent.
 
-        Writes only the parts (mode, setpoint) that differ from what the TRV
-        reports. A setpoint left pending after a mode change is written on the
-        next call; the room calls this on every fallback step.
+        The setpoint may be rounded to what the device can hold. Writes only
+        the parts (mode, setpoint) that differ from what the TRV reports. A
+        setpoint left pending after a mode change is written on the next call;
+        the room calls this on every fallback step.
 
         With force_mode the mode write is sent even if the TRV already reads
         self-regulating, and the setpoint is then written without comparing.
