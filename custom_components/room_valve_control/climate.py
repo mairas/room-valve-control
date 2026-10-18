@@ -139,7 +139,8 @@ class RoomClimate(ClimateEntity, RestoreEntity):
         Done before RestoreEntity saves the state, so the saved write count
         includes the hand back. Not done for a new entity id, after which the
         entity is re-added to the running room, nor while the entry unloads,
-        which has handed the room back already.
+        which leaves the TRVs as they are. Removing the room starts that
+        unload, from the update listener, before its thermostat is removed.
         """
         registry_entry = self.registry_entry
         renamed = (

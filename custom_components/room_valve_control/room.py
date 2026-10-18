@@ -34,7 +34,7 @@ class ControlMode(StrEnum):
     WAITING = "waiting"
     DIRECT = "direct"
     FALLBACK = "fallback"
-    # Handed back for good: the TRVs self-regulate and the room writes nothing.
+    # Stopped for good, handed back or not: the room writes nothing.
     STOPPED = "stopped"
 
 
@@ -180,6 +180,17 @@ class Room:
             self._last_error = None
             if self._target is not None:
                 await self._self_regulate(self._target, retry_deferred=True)
+
+    async def stop(self) -> None:
+        """
+        Stop the room, leaving its TRVs as they are.
+
+        Waits for a step or target change in progress; nothing writes after.
+        """
+        async with self._lock:
+            self._mode = ControlMode.STOPPED
+            self._last_output = None
+            self._last_error = None
 
     async def step(self, now: datetime, readings: Sequence[Reading]) -> None:
         """Run one control step; a stopped room does nothing."""

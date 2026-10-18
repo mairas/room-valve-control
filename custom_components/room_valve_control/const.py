@@ -7,6 +7,11 @@ DOMAIN: Final = "room_valve_control"
 
 SUBENTRY_TYPE_ROOM: Final = "room"
 
+# Repair issue translation keys; an issue's id adds the TRV's registry id or
+# the room's subentry id.
+ISSUE_UNUSABLE_TRV: Final = "unusable_trv"
+ISSUE_ROOM_WITHOUT_TRVS: Final = "room_without_trvs"
+
 # Room subentry data keys. The room's name is the subentry title. Durations are
 # stored as seconds, temperatures in °C, Kp in % per °C, the minimum change in
 # % points.

@@ -936,6 +936,97 @@ async def test_own_temperature_waits_for_changed_report_after_offset_write(
 
 
 @pytest.mark.usefixtures("full_spirit")
+async def test_failed_offset_write_keeps_the_earlier_gate(
+    hass: HomeAssistant, calls: list[ServiceCall], freezer: FrozenDateTimeFactory
+) -> None:
+    """A failed write opens no gate, and closes none an earlier write left."""
+    trv = SpiritTrv(hass, CLIMATE_ID)
+
+    async def fail(call: ServiceCall) -> None:
+        calls.append(call)
+        msg = "asleep"
+        raise HomeAssistantError(msg)
+
+    freezer.tick(1)
+    hass.services.async_register("number", "set_value", fail)
+    assert not await trv.set_offset(0.5)
+    assert trv.own_temperature == pytest.approx(CURRENT_TEMPERATURE + 1.2)
+
+    record_service(hass, calls, "number", "set_value")
+    assert await trv.set_offset(0.5)
+    hass.states.async_set(OFFSET_ID, "5.0")
+    freezer.tick(1)
+    hass.services.async_register("number", "set_value", fail)
+    assert not await trv.set_offset(1.0)
+    assert trv.own_temperature is None
+
+
+@pytest.mark.usefixtures("full_spirit")
+@pytest.mark.parametrize("outcome", ["timed out", "cancelled by zwave_js"])
+async def test_offset_write_of_unknown_outcome_keeps_the_gate(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    """A write that may still reach the node gates the reading like a sent one."""
+    monkeypatch.setattr(spirit, "SERVICE_TIMEOUT", 0.01)
+
+    async def stall(_call: ServiceCall) -> None:
+        await asyncio.Event().wait()
+
+    handler = stall if outcome == "timed out" else cancelled_command
+    hass.services.async_register("number", "set_value", handler)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+
+    assert not await trv.set_offset(0.5)
+    # The write lands late; the TRV reports again without it.
+    hass.states.async_set(OFFSET_ID, "5.0")
+    set_climate(hass, "heat")
+
+    assert trv.own_temperature is None
+
+
+@pytest.mark.usefixtures("full_spirit")
+async def test_report_during_an_offset_write_keeps_the_gate(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """A report the TRV sends while the write is in flight does not include it."""
+
+    async def report_mid_write(_call: ServiceCall) -> None:
+        freezer.tick(1)
+        set_climate(hass, "heat", current=CURRENT_TEMPERATURE + 0.3)
+
+    hass.services.async_register("number", "set_value", report_mid_write)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+
+    freezer.tick(1)
+    assert await trv.set_offset(0.5)
+    hass.states.async_set(OFFSET_ID, "5.0")
+
+    assert trv.own_temperature is None
+
+
+@pytest.mark.usefixtures("full_spirit")
+async def test_report_during_a_timed_out_offset_write_keeps_the_gate(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, freezer: FrozenDateTimeFactory
+) -> None:
+    """A report sent while a write stalls predates the write landing late."""
+    monkeypatch.setattr(spirit, "SERVICE_TIMEOUT", 0.01)
+
+    async def report_then_stall(_call: ServiceCall) -> None:
+        freezer.tick(1)
+        set_climate(hass, "heat", current=CURRENT_TEMPERATURE + 0.3)
+        await asyncio.Event().wait()
+
+    hass.services.async_register("number", "set_value", report_then_stall)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+
+    freezer.tick(1)
+    assert not await trv.set_offset(0.5)
+    hass.states.async_set(OFFSET_ID, "5.0")
+
+    assert trv.own_temperature is None
+
+
+@pytest.mark.usefixtures("full_spirit")
 @pytest.mark.parametrize("offset", [-1.2, -1.24])
 async def test_offset_write_without_change_sends_nothing(
     hass: HomeAssistant,

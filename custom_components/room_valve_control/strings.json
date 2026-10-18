@@ -113,5 +113,15 @@
         "name": "Device writes"
       }
     }
+  },
+  "issues": {
+    "unusable_trv": {
+      "title": "TRV left out of {room}",
+      "description": "{trv} is not usable: {reason}. The room is controlled without it, and the TRV is left as it is. Fix the TRV, or reconfigure the room without it; this issue clears when the integration next reloads."
+    },
+    "room_without_trvs": {
+      "title": "{room} is not controlled",
+      "description": "None of the room's TRVs is usable, so the room is not set up and its entities are unavailable. Fix a TRV, or reconfigure the room; this issue clears when the integration next reloads."
+    }
   }
 }

@@ -111,6 +111,9 @@ class FakeSpiritClimate(ClimateEntity):
         # While set, a preset write is applied only once it is, even if the
         # caller has given up: the node already has the command.
         self.stall_preset: asyncio.Event | None = None
+        # While set, an offset write is applied only once it is, even if the
+        # caller has given up: the node already has the command.
+        self.stall_offset: asyncio.Event | None = None
         # Heat mode writes whose command is cancelled, as on a zwave_js reload.
         self.cancelled_hvac_mode_writes = 0
         # A preset change not applied yet; the node applies later commands
@@ -127,6 +130,10 @@ class FakeSpiritClimate(ClimateEntity):
         self._attr_preset_mode = PRESET_NONE
         self._attr_target_temperature = TRV_SETPOINT
         self._offset_id = ids.offset
+
+    def set_direct(self) -> None:
+        """Put the TRV in mode 31, as an earlier run left it."""
+        self._apply_preset(DIRECT_MODE_PRESET)
 
     def set_available(self, *, available: bool) -> None:
         """Make the TRV's climate entity available or unavailable."""
@@ -226,6 +233,7 @@ async def async_setup_spirits(
 
     devices = dr.async_get(hass)
     by_valve = {ids.valve: entity for ids, entity in zip(TRVS, entities, strict=True)}
+    by_offset = {ids.offset: entity for ids, entity in zip(TRVS, entities, strict=True)}
     for ids in TRVS:
         device = devices.async_get_device_by_identifier(
             (ZWAVE_JS, f"{HOME_ID}-{ids.node_id}"), zwave_entry.entry_id
@@ -243,7 +251,21 @@ async def async_setup_spirits(
         trv = by_valve.get(entity_id)
         if trv is not None and trv.stall_valve is not None:
             await trv.stall_valve.wait()
-        hass.states.async_set(entity_id, str(float(call.data["value"])))
+        value = str(float(call.data["value"]))
+        offset_trv = by_offset.get(entity_id)
+        if offset_trv is None or offset_trv.stall_offset is None:
+            hass.states.async_set(entity_id, value)
+            return
+
+        async def apply_later(stall: asyncio.Event) -> None:
+            await stall.wait()
+            hass.states.async_set(entity_id, value)
+
+        await asyncio.shield(
+            hass.async_create_background_task(
+                apply_later(offset_trv.stall_offset), f"{entity_id} write"
+            )
+        )
 
     hass.services.async_register("number", "set_value", set_value)
     return entities
