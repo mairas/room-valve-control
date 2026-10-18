@@ -883,6 +883,22 @@ async def test_mode_31_report_drops_unconfirmed_writes(
     assert listening.pressed == Press(22.0, pressed_at)
 
 
+async def test_mode_31_report_drops_writes_that_never_landed(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    listening: SpiritTrv,
+) -> None:
+    """A write that never read back stops masking a press after mode 31."""
+    unknown_setpoint_writes(hass, freezer, monkeypatch, "timed out")
+    assert await listening.enter_self_regulation(22.0) == 0
+
+    leave_direct(hass, freezer)
+    pressed_at = report(hass, freezer, 22.0)
+
+    assert listening.pressed == Press(22.0, pressed_at)
+
+
 async def test_presses_are_recorded_only_while_listening(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory, listening: SpiritTrv
 ) -> None:
