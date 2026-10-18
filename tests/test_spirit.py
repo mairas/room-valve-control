@@ -761,6 +761,47 @@ async def test_superseded_write_reading_back_late_is_no_press(
     assert listening.pressed == Press(20.5, pressed_at)
 
 
+async def test_timed_out_write_landing_during_the_next_is_no_press(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    listening: SpiritTrv,
+) -> None:
+    """A timed-out write landing during the next one reads back as the room's own."""
+    unknown_setpoint_writes(hass, freezer, monkeypatch, "timed out")
+    assert await listening.enter_self_regulation(20.5) == 0
+
+    async def land_the_earlier_write(_call: ServiceCall) -> None:
+        report(hass, freezer, 20.5)
+
+    hass.services.async_register("climate", "set_temperature", land_the_earlier_write)
+    assert await listening.enter_self_regulation(20.0) == 1
+
+    report(hass, freezer, 20.0)
+    assert listening.pressed is None
+    pressed_at = report(hass, freezer, 20.5)
+
+    assert listening.pressed == Press(20.5, pressed_at)
+
+
+async def test_read_back_confirms_the_writes_before_it(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    listening: SpiritTrv,
+) -> None:
+    """A write reading back means every earlier one has landed or failed."""
+    unknown_setpoint_writes(hass, freezer, monkeypatch, "timed out")
+    for setpoint in (22.0, 20.5, 20.0):
+        assert await listening.enter_self_regulation(setpoint) == 0
+
+    report(hass, freezer, 20.5)
+    assert listening.pressed is None
+    pressed_at = report(hass, freezer, 22.0)
+
+    assert listening.pressed == Press(22.0, pressed_at)
+
+
 async def test_write_of_the_reported_setpoint_is_confirmed_at_once(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory, listening: SpiritTrv
 ) -> None:

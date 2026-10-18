@@ -214,9 +214,9 @@ class SpiritTrv:
         self._temperature_at_offset_write: float | None = None
         # When the last write was let through to a node reading dead.
         self._dead_node_write_at: datetime | None = None
-        # The setpoints written since the last one that read back, oldest
-        # first: zwave-js sends a node's commands in order, so a superseded
-        # write may still report before the latest.
+        # The setpoints written and not yet read back, oldest first.
+        # zwave-js sends a node's commands in order, so a write reading back
+        # means every earlier one has landed or failed.
         self._unconfirmed_setpoints: list[float] = []
         self._pressed: Press | None = None
         self._unsubscribes: list[CALLBACK_TYPE] = []
@@ -401,9 +401,16 @@ class SpiritTrv:
         if before is None or setpoint is None or setpoint == before:
             return
         unconfirmed = self._unconfirmed_setpoints
-        if any(_same_setpoint(setpoint, written) for written in unconfirmed):
-            if _same_setpoint(setpoint, unconfirmed[-1]):
-                unconfirmed.clear()
+        read_back = next(
+            (
+                index
+                for index, written in enumerate(unconfirmed)
+                if _same_setpoint(setpoint, written)
+            ),
+            None,
+        )
+        if read_back is not None:
+            del unconfirmed[: read_back + 1]
             return
         self._pressed = Press(setpoint, new.last_updated)
 
