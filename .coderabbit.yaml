@@ -1,0 +1,41 @@
+# yaml-language-server: $schema=https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+
+language: en-GB
+
+reviews:
+  profile: assertive
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  auto_review:
+    enabled: true
+    drafts: false
+
+  path_instructions:
+    - path: '**/*'
+      instructions: |
+        ## Infrastructure must not be committed
+        This repository is public. Flag any real hostname, domain, IP address,
+        internal URL, token, password or account name, including in tests and
+        README examples. Placeholders are fine; real values are not.
+
+        ## Echo comments
+        Flag any comment that merely restates what the code already says.
+        Request removal, or replacement with a comment that explains *why*.
+
+    - path: 'custom_components/**/*.py'
+      instructions: |
+        ## Home Assistant practice
+        Flag blocking I/O in the event loop, entities that write state from
+        outside the event loop, and frequently changing values exposed as
+        `extra_state_attributes` instead of separate sensor entities.
+
+  tools:
+    ruff:
+      enabled: true
+    actionlint:
+      enabled: true
+    shellcheck:
+      enabled: true
+    markdownlint:
+      enabled: false
