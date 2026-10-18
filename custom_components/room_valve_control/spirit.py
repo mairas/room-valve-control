@@ -354,9 +354,16 @@ class SpiritTrv:
         read-back of a setpoint written since the last one confirmed or the
         last mode 31 report. Entering heat, from mode 31 or anything else,
         carries the stored setpoint, so it is never a press.
+
+        Writes made while not listening are forgotten: their read-backs went
+        unheard.
         """
         if self._unsubscribes:
             return
+        self._unconfirmed_setpoints.clear()
+        self._subscribe()
+
+    def _subscribe(self) -> None:
         entity_id = self.climate_entity_id
         self._unsubscribes = [
             async_track_state_change_event(
@@ -381,7 +388,7 @@ class SpiritTrv:
         data = event.data
         if data["action"] == "update" and "entity_id" in data["changes"]:
             self.stop_listening()
-            self.start_listening()
+            self._subscribe()
 
     @callback
     def _async_climate_changed(self, event: Event[EventStateChangedData]) -> None:

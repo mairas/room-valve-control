@@ -899,6 +899,39 @@ async def test_presses_are_recorded_only_while_listening(
     assert listening.pressed is None
 
 
+async def test_write_unheard_before_listening_masks_no_press(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, listening: SpiritTrv
+) -> None:
+    """A hand back's write that reads back unheard is forgotten on restarting."""
+    listening.stop_listening()
+    assert await listening.enter_self_regulation(22.0) == 1
+    report(hass, freezer, 22.0)
+    listening.start_listening()
+
+    report(hass, freezer, 20.0)
+    pressed_at = report(hass, freezer, 22.0)
+
+    assert listening.pressed == Press(22.0, pressed_at)
+
+
+async def test_rename_keeps_unconfirmed_writes(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    full_spirit: Spirit,
+    listening: SpiritTrv,
+) -> None:
+    """A write reading back under the climate entity's new id is no press."""
+    assert await listening.enter_self_regulation(22.0) == 1
+    renamed = "climate.renamed"
+    full_spirit.entity_registry.async_update_entity(CLIMATE_ID, new_entity_id=renamed)
+    await hass.async_block_till_done()
+    hass.states.async_set(renamed, "heat", {"temperature": 21.0})
+    freezer.tick(timedelta(minutes=1))
+    hass.states.async_set(renamed, "heat", {"temperature": 22.0})
+
+    assert listening.pressed is None
+
+
 async def test_presses_follow_a_rename_while_listening(
     hass: HomeAssistant,
     freezer: FrozenDateTimeFactory,
