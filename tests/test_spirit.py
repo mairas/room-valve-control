@@ -686,12 +686,60 @@ async def test_written_setpoint_reading_back_is_no_press(
     Nothing is read in between: the read-back is recorded as it arrives.
     """
     report(hass, freezer, 20.0)
+    listening.clear_press()
     assert await listening.enter_self_regulation(21.0) == 1
 
     report(hass, freezer, 21.0)
+    assert listening.pressed is None
     pressed_at = report(hass, freezer, 20.0)
 
     assert listening.pressed == Press(20.0, pressed_at)
+
+
+async def test_off_step_setpoint_reading_back_is_no_press(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, listening: SpiritTrv
+) -> None:
+    """A setpoint off the step reads back as the step it was written as."""
+    assert await listening.enter_self_regulation(21.3) == 1
+
+    report(hass, freezer, 21.5)
+
+    assert listening.pressed is None
+
+
+def unknown_setpoint_writes(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    """Make setpoint writes time out or be cancelled by zwave_js."""
+    monkeypatch.setattr(spirit, "SERVICE_TIMEOUT", 0.01)
+
+    async def stall(_call: ServiceCall) -> None:
+        # The frozen clock reaches the timeout only when ticked.
+        freezer.tick(1)
+        await asyncio.Event().wait()
+
+    handler = stall if outcome == "timed out" else cancelled_command
+    hass.services.async_register("climate", "set_temperature", handler)
+
+
+@pytest.mark.parametrize("outcome", ["timed out", "cancelled by zwave_js"])
+async def test_setpoint_write_of_unknown_outcome_landing_late_is_no_press(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    listening: SpiritTrv,
+    outcome: str,
+) -> None:
+    """A write that may still reach the node reads back as the room's own."""
+    unknown_setpoint_writes(hass, freezer, monkeypatch, outcome)
+    assert await listening.enter_self_regulation(22.0) == 0
+
+    report(hass, freezer, 22.0)
+
+    assert listening.pressed is None
 
 
 async def test_superseded_write_reading_back_late_is_no_press(
