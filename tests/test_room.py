@@ -282,7 +282,8 @@ async def test_fallback_freezes_integrator_and_return_resumes_from_it() -> None:
 
     await room.step(at(150), fresh(20.5, at(150)))
 
-    assert room.control_mode is ControlMode.DIRECT
+    # mypy keeps control_mode narrowed across the awaited step
+    assert room.control_mode is ControlMode.DIRECT  # type: ignore[comparison-overlap]
     assert room.last_output == round(KP * 0.5 + integral)
     assert trv.calls[0] == ("direct",)
 
@@ -515,7 +516,7 @@ async def test_startup_without_readings_waits_until_stale_timeout() -> None:
 
     await room.step(START + STALE_TIMEOUT, [])
 
-    assert room.control_mode is ControlMode.FALLBACK
+    assert room.control_mode is ControlMode.FALLBACK  # type: ignore[comparison-overlap]
     assert trv.calls == [("heat",), ("setpoint", TARGET)]
 
 
@@ -580,7 +581,7 @@ async def test_hand_back_from_waiting_hands_back() -> None:
     await room.hand_back()
 
     assert trv.calls == [("heat",), ("setpoint", TARGET)]
-    assert room.control_mode is ControlMode.STOPPED
+    assert room.control_mode is ControlMode.STOPPED  # type: ignore[comparison-overlap]
 
 
 async def test_hand_back_waits_for_a_suspended_step() -> None:
