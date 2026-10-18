@@ -345,17 +345,20 @@ class SpiritTrv:
             },
         )
 
-    async def enter_self_regulation(self, setpoint: float) -> int:
+    async def enter_self_regulation(
+        self, setpoint: float, *, force_mode: bool = False
+    ) -> int:
         """
         Set heat mode, then the setpoint, skipping what already matches.
 
         After a mode change the setpoint is written only once heat mode reads
         back, and then without comparing: the reported setpoint is the one
         from before. If heat mode does not read back in time, the setpoint is
-        left to the next call.
+        left to the next call. With force_mode the mode is written whatever
+        the TRV reports.
         """
         sent = 0
-        if self.mode is not TrvMode.SELF_REGULATING:
+        if force_mode or self.mode is not TrvMode.SELF_REGULATING:
             if not await self._call(
                 CLIMATE_DOMAIN,
                 SERVICE_SET_HVAC_MODE,

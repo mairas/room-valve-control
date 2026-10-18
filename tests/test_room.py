@@ -1,6 +1,7 @@
 """Tests for the per-room control state machine."""
 
 import asyncio
+import contextlib
 import logging
 import math
 from datetime import UTC, datetime, timedelta
@@ -34,6 +35,9 @@ SETTINGS: Final = RoomSettings(
 SPIRIT_MAX_OFFSET: Final = 5.0
 START: Final = datetime(2026, 10, 16, 6, 0, tzinfo=UTC)
 TARGET: Final = 21.0
+OTHER_TARGET: Final = 22.5
+LATEST_TARGET: Final = 23.0
+RESTORED_INTEGRAL: Final = 10.0
 
 Call = tuple[object, ...]
 
@@ -86,10 +90,12 @@ class FakeTrv:
             self.mode = TrvMode.DIRECT
         return self.sends
 
-    async def enter_self_regulation(self, setpoint: float) -> int:
-        """Record heat mode, then setpoint, writing only what differs."""
+    async def enter_self_regulation(
+        self, setpoint: float, *, force_mode: bool = False
+    ) -> int:
+        """Record heat mode, then setpoint, writing only what differs unless forced."""
         sent = 0
-        if self.mode is not TrvMode.SELF_REGULATING:
+        if force_mode or self.mode is not TrvMode.SELF_REGULATING:
             self.calls.append(("heat",))
             await self._wait_for_gate()
             if not self.sends:
@@ -99,7 +105,7 @@ class FakeTrv:
                 return 1
             self.mode = TrvMode.SELF_REGULATING
             sent += 1
-        if self.setpoint != setpoint:
+        if force_mode or self.setpoint != setpoint:
             self.calls.append(("setpoint", setpoint))
             await self._wait_for_gate()
             if self.sends:
@@ -605,6 +611,33 @@ async def test_hand_back_waits_for_a_suspended_step() -> None:
     assert room.control_mode is ControlMode.STOPPED
 
 
+async def test_hand_back_forces_heat_on_a_cancelled_enter_direct() -> None:
+    """
+    A TRV whose direct-mode write was cut off by a cancel gets heat mode anyway.
+
+    The write may still reach the node, so its heat readback proves nothing.
+    """
+    directed = FakeTrv(valve=0.0)
+    entering = FakeTrv(valve=0.0, setpoint=TARGET)
+    untouched = FakeTrv(valve=0.0, setpoint=TARGET)
+    room = make_room([directed, entering, untouched])
+    await room.set_target(TARGET)
+    close_gates(entering)
+    step = asyncio.create_task(room.step(START, fresh(20.0, START)))
+    await entering.suspended.wait()
+    step.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await step
+    entering.gate = None
+    clear(directed, entering, untouched)
+
+    await room.hand_back()
+
+    assert directed.calls == [("heat",), ("setpoint", TARGET)]
+    assert entering.calls == [("heat",), ("setpoint", TARGET)]
+    assert untouched.calls == []
+
+
 async def test_stopped_room_writes_nothing() -> None:
     """After hand back neither steps nor targets reach the TRVs."""
     trv = FakeTrv(valve=0.0)
@@ -616,15 +649,33 @@ async def test_stopped_room_writes_nothing() -> None:
 
     await room.step(at(15), fresh(20.0, at(15)))
     await room.step(at(120), [])
-    await room.set_target(22.5)
+    await room.set_target(OTHER_TARGET)
     await room.hand_back()
 
     assert trv.calls == []
     assert room.device_writes == writes
     assert room.control_mode is ControlMode.STOPPED
-    assert room.target == TARGET
+    # Kept for the restore, so a reloaded room starts from it.
+    assert room.target == OTHER_TARGET
     assert room.last_output is None
     assert not room.needs_immediate_step(at(120), fresh(20.0, at(120)))
+
+
+async def test_target_set_during_hand_back_is_recorded_not_written() -> None:
+    """A target arriving while the TRVs are handed back waits for nothing."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    gate = close_gates(trv)
+    hand_back = asyncio.create_task(room.hand_back())
+    await trv.suspended.wait()
+
+    await room.set_target(OTHER_TARGET)
+    gate.set()
+    await hand_back
+
+    assert room.target == OTHER_TARGET
+    assert trv.calls == [("heat",), ("setpoint", TARGET)]
 
 
 async def test_target_set_during_fallback_step_is_written_after_it() -> None:
@@ -644,6 +695,42 @@ async def test_target_set_during_fallback_step_is_written_after_it() -> None:
     await set_target
 
     assert trv.calls == [("heat",), ("setpoint", TARGET), ("setpoint", 22.5)]
+
+
+async def test_target_set_during_step_is_recorded_at_once() -> None:
+    """A step suspended in a TRV write does not delay the new target."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await room.set_target(TARGET)
+    gate = close_gates(trv)
+    step = asyncio.create_task(room.step(START, fresh(20.0, START)))
+    await trv.suspended.wait()
+
+    set_target = asyncio.create_task(room.set_target(OTHER_TARGET))
+    await settle()
+
+    assert room.target == OTHER_TARGET
+    assert set_target.done()
+    gate.set()
+    await step
+
+
+async def test_fallback_write_after_a_step_uses_the_latest_target() -> None:
+    """Targets queued behind a fallback step write only the one current then."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    gate = close_gates(trv)
+    step = asyncio.create_task(room.step(at(90), []))
+    await trv.suspended.wait()
+
+    first = asyncio.create_task(room.set_target(OTHER_TARGET))
+    second = asyncio.create_task(room.set_target(LATEST_TARGET))
+    await settle()
+    gate.set()
+    await asyncio.gather(step, first, second)
+
+    assert trv.calls == [("heat",), ("setpoint", TARGET), ("setpoint", LATEST_TARGET)]
 
 
 async def test_hand_back_writes_trvs_concurrently() -> None:
@@ -828,15 +915,26 @@ async def test_failed_reentry_after_external_change_warns_once(
     assert warnings(caplog) == []
 
 
-async def test_first_direct_step_integrates_one_control_step() -> None:
-    """With no previous direct step the elapsed time is the control step."""
-    room = make_room([FakeTrv(valve=0.0)])
+async def test_first_direct_step_does_not_integrate() -> None:
+    """A new room has had no interval to integrate over, restored or not."""
+    room = make_room([FakeTrv(valve=0.0)], integral=RESTORED_INTEGRAL)
     await room.set_target(TARGET)
 
     await room.step(START, fresh(20.0, START))
 
+    assert room.integrator == RESTORED_INTEGRAL
+    assert room.last_output == round(KP * 1.0 + RESTORED_INTEGRAL)
+
+
+async def test_second_direct_step_integrates_the_time_since_the_first() -> None:
+    """Integration starts from the room's first direct step."""
+    room = make_room([FakeTrv(valve=0.0)])
+    await go_direct(room)
     expected = PIController(GAINS)
     expected.step(TARGET, 20.0, CONTROL_STEP, integrate=True)
+
+    await room.step(at(15), fresh(20.0, at(15)))
+
     assert room.integrator == pytest.approx(expected.integral)
 
 
@@ -912,3 +1010,14 @@ async def test_current_reading_is_mean_of_fresh_finite_readings() -> None:
 
     assert room.current_reading(now, readings) == pytest.approx(20.5)
     assert room.current_reading(now, [Reading(math.nan, now)]) is None
+
+
+async def test_controller_state_is_what_the_controller_restores_from() -> None:
+    """The room's controller state restores a controller with its integral."""
+    room = make_room([FakeTrv(valve=0.0)])
+    await go_direct(room)
+    await room.step(at(15), fresh(20.0, at(15)))
+
+    restored = PIController.from_dict(GAINS, room.controller_state)
+
+    assert restored.integral == room.integrator > 0

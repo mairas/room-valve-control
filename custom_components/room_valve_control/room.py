@@ -4,6 +4,7 @@ import asyncio
 import logging
 import math
 from dataclasses import dataclass
+from datetime import timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
@@ -12,7 +13,7 @@ from .trv import Trv, TrvMode
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from datetime import datetime, timedelta
+    from datetime import datetime
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -82,6 +83,10 @@ class Room:
         # The TRVs this room switched to direct mode and has not switched out
         # since; finding one of them elsewhere is an external change.
         self._directed: set[Trv] = set()
+        # The TRVs whose direct-mode write has not returned. A cancelled write
+        # may still reach the node after the hand back, whose readback then
+        # shows self-regulation, so the hand back forces their mode write.
+        self._entering_direct: set[Trv] = set()
         # One operation at a time: interleaved at a TRV await, a step could put
         # handed-back TRVs back in direct mode, or a target change could write a
         # setpoint concurrently with a mode change, which loses the setpoint.
@@ -113,6 +118,11 @@ class Room:
         return self._controller.integral
 
     @property
+    def controller_state(self) -> dict[str, float]:
+        """Return the PI controller's state to store across restarts."""
+        return self._controller.as_dict()
+
+    @property
     def device_writes(self) -> int:
         """Return the number of writes sent to the TRVs."""
         return self._device_writes
@@ -138,16 +148,20 @@ class Room:
 
     async def set_target(self, target: float) -> None:
         """
-        Set the target; in fallback, write it to the TRVs right away.
+        Set the target at once; in fallback, also write it to the TRVs.
 
-        Ignored once stopped, so the target stays what the TRVs were handed.
+        A stopped room only records it, for the next room to start from.
+        Only the fallback write waits for an operation in progress, and it
+        writes the target current when it runs. Every switch into fallback
+        happens under the lock before the step's own write, so outside
+        fallback no write is needed.
         """
+        self._target = target
+        if self._mode is not ControlMode.FALLBACK:
+            return
         async with self._lock:
-            if self._mode is ControlMode.STOPPED:
-                return
-            self._target = target
             if self._mode is ControlMode.FALLBACK:
-                await self._self_regulate(target)
+                await self._self_regulate(self._target)
 
     async def hand_back(self) -> None:
         """
@@ -155,7 +169,8 @@ class Room:
 
         Waits for a step or target change in progress. The TRVs get the target,
         if there is one; a TRV whose mode change has not read back yet is called
-        once more, since the setpoint is only written after it does.
+        once more, since the setpoint is only written after it does. A TRV
+        whose direct-mode write was cut off gets heat mode however it reads.
         """
         async with self._lock:
             if self._mode is ControlMode.STOPPED:
@@ -189,9 +204,10 @@ class Room:
 
     async def _step_direct(self, now: datetime, target: float, reading: float) -> None:
         self._mode = ControlMode.DIRECT
-        elapsed = self._settings.control_step
+        # A new room's first direct step has no interval behind it to integrate.
+        elapsed = timedelta(0)
         if self._last_direct_step is not None:
-            elapsed = min(now - self._last_direct_step, elapsed)
+            elapsed = min(now - self._last_direct_step, self._settings.control_step)
         self._last_direct_step = now
         available = [trv for trv in self._trvs if trv.available]
         output = round(
@@ -224,7 +240,11 @@ class Room:
                 trv.name,
                 trv.mode,
             )
-        if await trv.enter_direct():
+        # Not discarded in a finally: a cancelled write must stay recorded.
+        self._entering_direct.add(trv)
+        entered = await trv.enter_direct()
+        self._entering_direct.discard(trv)
+        if entered:
             self._device_writes += 1
             self._directed.add(trv)
             return True
@@ -249,18 +269,24 @@ class Room:
         available = [trv for trv in self._trvs if trv.available]
         sent = await asyncio.gather(
             *(
-                _enter_self_regulation(trv, setpoint, retry_deferred=retry_deferred)
+                _enter_self_regulation(
+                    trv,
+                    setpoint,
+                    retry_deferred=retry_deferred,
+                    force_mode=trv in self._entering_direct,
+                )
                 for trv in available
             )
         )
         self._device_writes += sum(sent)
         self._directed.difference_update(available)
+        self._entering_direct.difference_update(available)
 
 
 async def _enter_self_regulation(
-    trv: Trv, setpoint: float, *, retry_deferred: bool
+    trv: Trv, setpoint: float, *, retry_deferred: bool, force_mode: bool
 ) -> int:
-    sent = await trv.enter_self_regulation(setpoint)
+    sent = await trv.enter_self_regulation(setpoint, force_mode=force_mode)
     if retry_deferred and sent and trv.mode is not TrvMode.SELF_REGULATING:
         sent += await trv.enter_self_regulation(setpoint)
     return sent

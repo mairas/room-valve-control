@@ -71,13 +71,20 @@ class Trv(Protocol):
         """Switch to direct valve control; return whether the write was sent."""
         ...
 
-    async def enter_self_regulation(self, setpoint: float) -> int:
+    async def enter_self_regulation(
+        self, setpoint: float, *, force_mode: bool = False
+    ) -> int:
         """
         Switch to self-regulation at setpoint; return the writes sent.
 
         Writes only the parts (mode, setpoint) that differ from what the TRV
         reports. A setpoint left pending after a mode change is written on the
         next call; the room calls this on every fallback step.
+
+        With force_mode the mode write is sent even if the TRV already reads
+        self-regulating, and the setpoint is then written without comparing.
+        zwave-js sends a node's commands in order, so the mode lands after a
+        preset change still in flight.
         """
         ...
 

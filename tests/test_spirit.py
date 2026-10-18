@@ -343,6 +343,26 @@ async def test_enter_self_regulation_sets_mode_then_setpoint(
     ]
 
 
+@pytest.mark.usefixtures("full_spirit")
+async def test_forced_self_regulation_writes_despite_heat_readback(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """
+    Forced, heat mode and the setpoint are written though both already match.
+
+    A preset change still in flight would otherwise put the TRV back in
+    mode 31 after a hand back that wrote nothing.
+    """
+    switch_to_heat_on_mode_write(hass, calls, stale_setpoint=19.5)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    set_climate(hass, "heat", setpoint=19.5)
+
+    sent = await trv.enter_self_regulation(19.5, force_mode=True)
+
+    assert sent == 2  # noqa: PLR2004
+    assert [c.service for c in calls] == ["set_hvac_mode", "set_temperature"]
+
+
 @pytest.mark.usefixtures("full_spirit", "short_mode_change_timeout")
 async def test_setpoint_waits_for_mode_change(
     hass: HomeAssistant, calls: list[ServiceCall]
