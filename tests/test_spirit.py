@@ -842,6 +842,22 @@ async def test_write_not_sent_is_not_awaited(
     assert listening.pressed == Press(20.0, pressed_at)
 
 
+async def test_write_failing_after_its_value_reported_does_not_raise(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, listening: SpiritTrv
+) -> None:
+    """A report of the value during a write that then fails is no press."""
+
+    async def report_then_fail(_call: ServiceCall) -> None:
+        report(hass, freezer, 20.0)
+        msg = "asleep"
+        raise HomeAssistantError(msg)
+
+    hass.services.async_register("climate", "set_temperature", report_then_fail)
+
+    assert await listening.enter_self_regulation(20.0) == 0
+    assert listening.pressed is None
+
+
 async def test_mode_31_report_drops_unconfirmed_writes(
     hass: HomeAssistant,
     freezer: FrozenDateTimeFactory,

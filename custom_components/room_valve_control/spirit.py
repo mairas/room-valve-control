@@ -510,7 +510,9 @@ class SpiritTrv:
             {ATTR_ENTITY_ID: self.climate_entity_id, ATTR_TEMPERATURE: setpoint},
         )
         if outcome is _Outcome.NOT_SENT:
-            self._unconfirmed_setpoints.remove(setpoint)
+            # A report of the value during the write may have dropped it.
+            if setpoint in self._unconfirmed_setpoints:
+                self._unconfirmed_setpoints.remove(setpoint)
         elif outcome is _Outcome.SENT:
             self._setpoint_pending = False
             sent += 1
