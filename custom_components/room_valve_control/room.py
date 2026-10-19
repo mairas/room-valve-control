@@ -1,4 +1,4 @@
-"""Per-room control: waiting, direct valve control, or fallback to the TRVs."""
+"""Per-room control: waiting, direct control, or fallback to the devices."""
 
 import asyncio
 import logging
@@ -8,11 +8,14 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
+from .const import DEFAULT_FALLBACK_FLOOR_SETPOINT
 from .controller import PIController, should_write_valve
 from .trv import Press, Trv, TrvMode
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from .floor_heater import FloorHeater
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -44,6 +47,7 @@ class RoomSettings:
     control_step: timedelta
     min_valve_change: float
     stale_timeout: timedelta
+    fallback_floor_setpoint: float = DEFAULT_FALLBACK_FLOOR_SETPOINT
 
 
 @dataclass(frozen=True)
@@ -55,7 +59,14 @@ class Reading:
 
 
 class Room:
-    """The control state machine of one room and its TRVs."""
+    """
+    The control state machine of one room and its TRVs or floor heaters.
+
+    A floor room gets the PI output as the share of each control step its
+    heaters heat. Without the room they hold the fallback floor setpoint, so
+    every way out of direct control writes it, after the heater has dropped
+    its pending off edge.
+    """
 
     def __init__(  # noqa: PLR0913
         self,
@@ -66,10 +77,15 @@ class Room:
         *,
         name: str,
         device_writes: int = 0,
+        heaters: Sequence[FloorHeater] = (),
     ) -> None:
-        """Create a room; name is used in log messages."""
+        """Create a room of TRVs or of heaters; name is used in log messages."""
+        if trvs and heaters:
+            msg = f"{name}: a room cannot have both TRVs and floor heaters"
+            raise ValueError(msg)
         self._settings = settings
         self._trvs = trvs
+        self._heaters = heaters
         self._controller = controller
         self._started_at = started_at
         self._name = name
@@ -125,8 +141,12 @@ class Room:
 
     @property
     def device_writes(self) -> int:
-        """Return the number of writes sent to the TRVs."""
+        """Return the number of writes sent to the TRVs or heaters."""
         return self._device_writes
+
+    def count_edge_writes(self, sent: int) -> None:
+        """Count the writes of a heater's timed off edge, sent outside a step."""
+        self._device_writes += sent
 
     def current_reading(
         self, now: datetime, readings: Sequence[Reading]
@@ -149,7 +169,7 @@ class Room:
 
     async def set_target(self, target: float, now: datetime) -> None:
         """
-        Set the target at once, as of now; in fallback, also write it.
+        Set the target at once, as of now; in fallback, also write it to TRVs.
 
         A stopped room only records it, for the next room to start from.
         Only the fallback write waits for an operation in progress, and it
@@ -173,6 +193,7 @@ class Room:
         if there is one; a TRV whose mode change has not read back yet is called
         once more, since the setpoint is only written after it does. A TRV
         whose direct-mode write was cut off gets heat mode however it reads.
+        Heaters hold the fallback floor setpoint, target or not.
         """
         async with self._lock:
             if self._mode is ControlMode.STOPPED:
@@ -182,17 +203,34 @@ class Room:
             self._last_error = None
             if self._target is not None:
                 await self._self_regulate(self._target, retry_deferred=True)
+            await self._hold_fallback()
 
     async def stop(self) -> None:
         """
         Stop the room, leaving its TRVs as they are.
 
-        Waits for a step or target change in progress; nothing writes after.
+        Heaters hold the fallback floor setpoint: their "on" is timed and must
+        not outlive the timer. Waits for a step or target change in progress;
+        nothing writes after.
         """
         async with self._lock:
+            stopped = self._mode is ControlMode.STOPPED
             self._mode = ControlMode.STOPPED
             self._last_output = None
             self._last_error = None
+            if not stopped:
+                await self._hold_fallback()
+
+    async def hold_fallback(self) -> None:
+        """
+        Have the heaters hold the fallback floor setpoint; TRVs are left alone.
+
+        For a starting room, whose heaters may still be on from before it.
+        Waits for an operation in progress; a stopped room writes nothing.
+        """
+        async with self._lock:
+            if self._mode is not ControlMode.STOPPED:
+                await self._hold_fallback()
 
     async def step(self, now: datetime, readings: Sequence[Reading]) -> None:
         """Run one control step; a stopped room does nothing."""
@@ -215,6 +253,7 @@ class Room:
         self._last_output = None
         self._last_error = None
         await self._self_regulate(self._target)
+        await self._hold_fallback()
 
     def _adopt_press(self) -> None:
         """
@@ -252,11 +291,18 @@ class Room:
             elapsed = min(now - self._last_direct_step, self._settings.control_step)
         self._last_direct_step = now
         available = [trv for trv in self._trvs if trv.available]
+        heaters = [heater for heater in self._heaters if heater.available]
         output = round(
-            self._controller.step(target, reading, elapsed, integrate=bool(available))
+            self._controller.step(
+                target, reading, elapsed, integrate=bool(available or heaters)
+            )
         )
         self._last_output = output
         self._last_error = target - reading
+        for heater in heaters:
+            self._device_writes += await heater.apply_duty(
+                output, self._settings.control_step, now
+            )
         for trv in available:
             # Entering direct mode moves the valve to its last direct-mode value,
             # which the readback does not show yet.
@@ -323,6 +369,15 @@ class Room:
         self._device_writes += sum(sent)
         self._directed.difference_update(available)
         self._entering_direct.difference_update(available)
+
+    async def _hold_fallback(self) -> None:
+        # Unavailable heaters too: holding first drops the pending off edge,
+        # which would otherwise overwrite the fallback once they return.
+        setpoint = self._settings.fallback_floor_setpoint
+        sent = await asyncio.gather(
+            *(heater.hold_setpoint(setpoint) for heater in self._heaters)
+        )
+        self._device_writes += sum(sent)
 
 
 async def _enter_self_regulation(

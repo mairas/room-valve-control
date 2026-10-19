@@ -56,3 +56,5 @@ DEFAULT_MIN_CHANGE: Final = 5.0
 # Wide enough for every setpoint the calendar script writes.
 DEFAULT_MIN_TARGET: Final = 5.0
 DEFAULT_MAX_TARGET: Final = 30.0
+# The floor setpoint a floor thermostat holds on its own without the room.
+DEFAULT_FALLBACK_FLOOR_SETPOINT: Final = 22.0
