@@ -340,6 +340,35 @@ async def test_failed_write_is_not_counted(
     assert await heater.apply_duty(40, PERIOD, dt_util.utcnow()) == 0
 
 
+@pytest.mark.parametrize(
+    ("reported", "failing"),
+    [
+        (("off", HOLD_PRESET), "set_hvac_mode"),
+        (("heat", PROGRAM_PRESET), "set_preset_mode"),
+    ],
+    ids=["heat_mode", "hold_preset"],
+)
+async def test_failed_mode_write_skips_setpoint(
+    hass: HomeAssistant,
+    heater: ClimateFloorHeater,
+    writes: list[Write],
+    reported: tuple[str, str],
+    failing: str,
+) -> None:
+    """Without heat mode or hold the setpoint would not hold, so it is not sent."""
+    state, preset = reported
+    set_climate(hass, state, preset=preset)
+
+    async def failed(_call: ServiceCall) -> None:
+        msg = "no MQTT connection"
+        raise HomeAssistantError(msg)
+
+    hass.services.async_register("climate", failing, failed)
+
+    assert await heater.apply_duty(40, PERIOD, dt_util.utcnow()) == 0
+    assert writes == []
+
+
 async def test_hold_cancels_pending_off(
     hass: HomeAssistant,
     freezer: FrozenDateTimeFactory,
