@@ -22,9 +22,14 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.room_valve_control.const import (
     CONF_CONTROL_STEP,
+    CONF_FALLBACK_FLOOR_SETPOINT,
+    CONF_FLOOR_HEATERS,
+    CONF_FLOOR_MAX,
+    CONF_FLOOR_MIN,
     CONF_KP,
     CONF_MAX_TARGET,
     CONF_MIN_CHANGE,
+    CONF_MIN_ON_TIME,
     CONF_MIN_TARGET,
     CONF_SENSORS,
     CONF_STALE_TIMEOUT,
@@ -35,6 +40,7 @@ from custom_components.room_valve_control.const import (
 )
 
 from .helpers import add_offset_entity, add_spirit_device, add_valve_entity
+from .live_room import FLOOR_KEYS
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import SubentryFlowResult
@@ -53,6 +59,10 @@ DISABLED_OFFSET_TRV: Final = "climate.office_trv"
 DISABLED_OFFSET_ID: Final = "number.office_trv_temperature_offset"
 NOT_A_SPIRIT: Final = "climate.heat_pump"
 DEVICELESS_TRV: Final = "climate.deviceless_trv"
+HEATER_1: Final = "climate.bathroom_floor"
+HEATER_2: Final = "climate.hallway_floor"
+DISABLED_HEATER: Final = "climate.sauna_floor"
+UNREGISTERED_HEATER: Final = "climate.yaml_floor"
 ZERO_DURATION: Final = {"hours": 0, "minutes": 0, "seconds": 0}
 
 DEFAULT_PARAMETERS: Final = {
@@ -63,12 +73,17 @@ DEFAULT_PARAMETERS: Final = {
     CONF_STALE_TIMEOUT: 2700.0,
     CONF_MIN_TARGET: 5.0,
     CONF_MAX_TARGET: 30.0,
+    CONF_FLOOR_MAX: 26.0,
+    CONF_FLOOR_MIN: 17.0,
+    CONF_FALLBACK_FLOOR_SETPOINT: 22.0,
+    CONF_MIN_ON_TIME: 300.0,
 }
 
 ERROR_KEYS: Final = (
     "no_sensor",
     "sensor_not_registered",
-    "no_trv",
+    "no_trv_or_heater",
+    "trvs_and_heaters",
     "trv_in_use",
     "trv_entity_missing",
     "trv_entity_disabled",
@@ -77,6 +92,12 @@ ERROR_KEYS: Final = (
     "not_finite",
     "min_change_out_of_range",
     "target_range_empty",
+    "heater_in_use",
+    "heater_not_registered",
+    "heater_entity_disabled",
+    "not_whole_degrees",
+    "floor_setpoints_out_of_order",
+    "min_on_time_too_long",
 )
 
 
@@ -108,6 +129,18 @@ def registry_entries(hass: HomeAssistant) -> None:
         DISABLED_OFFSET_TRV,
         offset_disabled_by=er.RegistryEntryDisabler.INTEGRATION,
     )
+    registry = er.async_get(hass)
+    for heater in (HEATER_1, HEATER_2):
+        registry.async_get_or_create(
+            "climate", "test", heater, suggested_object_id=heater.split(".", 1)[1]
+        )
+    registry.async_get_or_create(
+        "climate",
+        "test",
+        DISABLED_HEATER,
+        suggested_object_id=DISABLED_HEATER.split(".", 1)[1],
+        disabled_by=er.RegistryEntryDisabler.USER,
+    )
 
 
 def _room_input(**overrides: Any) -> dict[str, Any]:
@@ -115,6 +148,15 @@ def _room_input(**overrides: Any) -> dict[str, Any]:
         CONF_NAME: "Bedroom",
         CONF_SENSORS: [SENSOR],
         CONF_TRVS: [TRV_1, TRV_2],
+    } | overrides
+
+
+def _floor_input(**overrides: Any) -> dict[str, Any]:
+    """Return a floor room's form input, leaving the TRV field untouched."""
+    return {
+        CONF_NAME: "Bathroom",
+        CONF_SENSORS: [SENSOR],
+        CONF_FLOOR_HEATERS: [HEATER_1],
     } | overrides
 
 
@@ -134,16 +176,24 @@ def _registry_ids(hass: HomeAssistant, *entity_ids: str) -> list[str]:
     return [entry.id for entry in entries if entry is not None]
 
 
-def _room_data(hass: HomeAssistant, trvs: list[str]) -> dict[str, Any]:
+def _room_data(
+    hass: HomeAssistant, trvs: list[str], heaters: list[str] | None = None
+) -> dict[str, Any]:
     return DEFAULT_PARAMETERS | {
         CONF_SENSORS: _registry_ids(hass, SENSOR),
         CONF_TRVS: _registry_ids(hass, *trvs),
+        CONF_FLOOR_HEATERS: _registry_ids(hass, *(heaters or [])),
     }
 
 
-def _room(hass: HomeAssistant, title: str, trvs: list[str]) -> ConfigSubentryData:
+def _room(
+    hass: HomeAssistant,
+    title: str,
+    trvs: list[str],
+    heaters: list[str] | None = None,
+) -> ConfigSubentryData:
     return ConfigSubentryData(
-        data=_room_data(hass, trvs),
+        data=_room_data(hass, trvs, heaters),
         subentry_type=SUBENTRY_TYPE_ROOM,
         title=title,
         unique_id=None,
@@ -356,7 +406,11 @@ async def test_trv_in_another_room_is_refused(hass: HomeAssistant) -> None:
     ("overrides", "errors"),
     [
         ({CONF_SENSORS: []}, {CONF_SENSORS: "no_sensor"}),
-        ({CONF_TRVS: []}, {CONF_TRVS: "no_trv"}),
+        ({CONF_TRVS: []}, {CONF_TRVS: "no_trv_or_heater"}),
+        (
+            {CONF_FLOOR_HEATERS: [HEATER_1]},
+            {CONF_FLOOR_HEATERS: "trvs_and_heaters"},
+        ),
         ({CONF_KP: 0}, {CONF_KP: "not_positive"}),
         ({CONF_TI: ZERO_DURATION}, {CONF_TI: "not_positive"}),
         ({CONF_CONTROL_STEP: ZERO_DURATION}, {CONF_CONTROL_STEP: "not_positive"}),
@@ -415,6 +469,167 @@ async def test_repeated_selections_are_stored_once(hass: HomeAssistant) -> None:
     (subentry,) = entry.subentries.values()
     assert subentry.data[CONF_SENSORS] == _registry_ids(hass, SENSOR)
     assert subentry.data[CONF_TRVS] == _registry_ids(hass, TRV_2, TRV_1)
+
+
+async def test_floor_room_is_stored(hass: HomeAssistant) -> None:
+    """A floor room stores its heaters by registry id, floor defaults, no TRV."""
+    entry = await _add_entry(hass)
+
+    result = await _create_room(
+        hass, entry, _floor_input(**{CONF_FLOOR_HEATERS: [HEATER_2, HEATER_1]})
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    (subentry,) = entry.subentries.values()
+    assert dict(subentry.data) == _room_data(hass, [], [HEATER_2, HEATER_1])
+
+
+async def test_floor_parameters_are_stored(hass: HomeAssistant) -> None:
+    """Entered floor setpoints are stored, the minimum on-time in seconds."""
+    entry = await _add_entry(hass)
+
+    result = await _create_room(
+        hass,
+        entry,
+        _floor_input(
+            **{
+                CONF_CONTROL_STEP: {"hours": 0, "minutes": 30, "seconds": 0},
+                CONF_FLOOR_MAX: 28,
+                CONF_FLOOR_MIN: 15,
+                CONF_FALLBACK_FLOOR_SETPOINT: 20,
+                CONF_MIN_ON_TIME: {"hours": 0, "minutes": 15, "seconds": 0},
+            }
+        ),
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    (subentry,) = entry.subentries.values()
+    assert dict(subentry.data) == _room_data(hass, [], [HEATER_1]) | {
+        CONF_CONTROL_STEP: 1800.0,
+        CONF_FLOOR_MAX: 28.0,
+        CONF_FLOOR_MIN: 15.0,
+        CONF_FALLBACK_FLOOR_SETPOINT: 20.0,
+        CONF_MIN_ON_TIME: 900.0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("overrides", "errors"),
+    [
+        ({CONF_FLOOR_HEATERS: []}, {CONF_TRVS: "no_trv_or_heater"}),
+        (
+            {CONF_FLOOR_MIN: 22, CONF_FALLBACK_FLOOR_SETPOINT: 22},
+            {CONF_FALLBACK_FLOOR_SETPOINT: "floor_setpoints_out_of_order"},
+        ),
+        (
+            {CONF_FALLBACK_FLOOR_SETPOINT: 26, CONF_FLOOR_MAX: 26},
+            {CONF_FLOOR_MAX: "floor_setpoints_out_of_order"},
+        ),
+        ({CONF_FLOOR_MAX: 26.5}, {CONF_FLOOR_MAX: "not_whole_degrees"}),
+        ({CONF_FLOOR_MIN: 17.5}, {CONF_FLOOR_MIN: "not_whole_degrees"}),
+        (
+            {CONF_FALLBACK_FLOOR_SETPOINT: 21.5},
+            {CONF_FALLBACK_FLOOR_SETPOINT: "not_whole_degrees"},
+        ),
+        (
+            {CONF_MIN_ON_TIME: {"hours": 0, "minutes": 7, "seconds": 31}},
+            {CONF_MIN_ON_TIME: "min_on_time_too_long"},
+        ),
+        (
+            {CONF_FLOOR_HEATERS: [DISABLED_HEATER]},
+            {CONF_FLOOR_HEATERS: "heater_entity_disabled"},
+        ),
+        (
+            {CONF_FLOOR_HEATERS: [HEATER_1, UNREGISTERED_HEATER]},
+            {CONF_FLOOR_HEATERS: "heater_not_registered"},
+        ),
+    ],
+)
+async def test_invalid_floor_room_is_refused_on_its_field(
+    hass: HomeAssistant, overrides: dict[str, Any], errors: dict[str, str]
+) -> None:
+    """Each floor constraint is reported on the field that breaks it."""
+    entry = await _add_entry(hass)
+
+    result = await _create_room(hass, entry, _floor_input(**overrides))
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == errors
+    assert entry.subentries == {}
+
+
+async def test_min_on_time_of_half_the_control_step_is_accepted(
+    hass: HomeAssistant,
+) -> None:
+    """The minimum on-time may be half the control step, the default 15 min."""
+    entry = await _add_entry(hass)
+
+    result = await _create_room(
+        hass,
+        entry,
+        _floor_input(**{CONF_MIN_ON_TIME: {"hours": 0, "minutes": 7, "seconds": 30}}),
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_floor_fields_of_a_trv_room_are_not_checked(
+    hass: HomeAssistant,
+) -> None:
+    """A TRV room is not refused for floor values it does not use."""
+    entry = await _add_entry(hass)
+
+    result = await _create_room(
+        hass,
+        entry,
+        _room_input(
+            **{
+                CONF_CONTROL_STEP: {"hours": 0, "minutes": 5, "seconds": 0},
+                CONF_FLOOR_MAX: 26.5,
+            }
+        ),
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+
+@pytest.mark.parametrize(
+    ("other_trvs", "other_heaters", "selected"),
+    [
+        ([], [HEATER_1], [HEATER_2, HEATER_1]),
+        ([TRV_1], [], [TRV_1]),
+    ],
+    ids=["heater_of_a_floor_room", "trv_of_a_trv_room"],
+)
+async def test_heater_in_another_room_is_refused(
+    hass: HomeAssistant,
+    other_trvs: list[str],
+    other_heaters: list[str],
+    selected: list[str],
+) -> None:
+    """A device already in another room cannot be a heater, naming that room."""
+    entry = await _add_entry(hass, [_room(hass, "Hall", other_trvs, other_heaters)])
+
+    result = await _create_room(
+        hass, entry, _floor_input(**{CONF_FLOOR_HEATERS: selected})
+    )
+
+    assert result["errors"] == {CONF_FLOOR_HEATERS: "heater_in_use"}
+    placeholders = result["description_placeholders"]
+    assert placeholders is not None
+    assert placeholders["heater"] == selected[-1]
+    assert placeholders["room"] == "Hall"
+
+
+async def test_floor_heater_of_another_room_cannot_be_a_trv(
+    hass: HomeAssistant,
+) -> None:
+    """The TRV in-use check also covers other rooms' floor heaters."""
+    entry = await _add_entry(hass, [_room(hass, "Hall", [], [TRV_1])])
+
+    result = await _create_room(hass, entry, _room_input())
+
+    assert result["errors"] == {CONF_TRVS: "trv_in_use"}
 
 
 async def _reconfigure_room(
@@ -587,6 +802,51 @@ def _config_subentry(hass: HomeAssistant, title: str, trv: str) -> ConfigSubentr
         title=title,
         unique_id=None,
     )
+
+
+async def test_reconfigure_room_stored_before_floor_heaters(
+    hass: HomeAssistant,
+) -> None:
+    """A room without the floor keys shows and stores their defaults."""
+    stored = _room(hass, "Bedroom", [TRV_1])
+    stored["data"] = {
+        key: value for key, value in stored["data"].items() if key not in FLOOR_KEYS
+    }
+    entry = await _add_entry(hass, [stored])
+    (subentry_id,) = entry.subentries
+
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_ROOM),
+        context={"source": SOURCE_RECONFIGURE, "subentry_id": subentry_id},
+    )
+    assert _default(result, CONF_FLOOR_HEATERS) == []
+    assert _default(result, CONF_FLOOR_MAX) == DEFAULT_PARAMETERS[CONF_FLOOR_MAX]
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {CONF_NAME: "Bedroom"}
+    )
+
+    assert result["reason"] == "reconfigure_successful"
+    assert dict(entry.subentries[subentry_id].data) == _room_data(hass, [TRV_1])
+
+
+async def test_reconfigure_trv_room_into_floor_room(hass: HomeAssistant) -> None:
+    """Clearing the TRVs and selecting heaters makes the room a floor room."""
+    entry = await _add_entry(hass, [_room(hass, "Bathroom", [TRV_1])])
+
+    result = await _reconfigure_room(hass, entry, _floor_input(**{CONF_TRVS: []}))
+
+    assert result["reason"] == "reconfigure_successful"
+    (subentry,) = entry.subentries.values()
+    assert dict(subentry.data) == _room_data(hass, [], [HEATER_1])
+
+
+async def test_reconfigure_keeps_its_own_heaters(hass: HomeAssistant) -> None:
+    """A floor room's own heaters are not in use by another room."""
+    entry = await _add_entry(hass, [_room(hass, "Bathroom", [], [HEATER_1])])
+
+    result = await _reconfigure_room(hass, entry, {CONF_NAME: "Bathroom"})
+
+    assert result["reason"] == "reconfigure_successful"
 
 
 def test_strings_match_english_translation() -> None:

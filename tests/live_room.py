@@ -1,4 +1,8 @@
-"""A room entry over live fake Spirit TRVs that apply and record their writes."""
+"""
+A room entry over live fake devices that apply and record their writes.
+
+The devices are Spirit TRVs and floor-heating thermostats.
+"""
 
 import asyncio
 from dataclasses import dataclass
@@ -26,12 +30,18 @@ from pytest_homeassistant_custom_component.common import (
 
 from custom_components.room_valve_control.config_flow import DEFAULT_ROOM
 from custom_components.room_valve_control.const import (
+    CONF_FALLBACK_FLOOR_SETPOINT,
+    CONF_FLOOR_HEATERS,
+    CONF_FLOOR_MAX,
+    CONF_FLOOR_MIN,
+    CONF_MIN_ON_TIME,
     CONF_SENSORS,
     CONF_TRVS,
     DEFAULT_CONTROL_STEP,
     DOMAIN,
     SUBENTRY_TYPE_ROOM,
 )
+from custom_components.room_valve_control.floor_heater import HOLD_PRESET
 from custom_components.room_valve_control.spirit import DIRECT_MODE_PRESET
 
 from .helpers import (
@@ -62,6 +72,18 @@ OFFSET_TENTHS_PER_DEGREE: Final = 10
 TRV_SETPOINT: Final = 21.0
 # Event loop iterations async_wait_for allows; far more than any write needs.
 WAIT_ITERATIONS: Final = 1000
+FLOOR_INTEGRATION: Final = "fake_floor"
+FLOOR_HEATERS: Final = ("climate.bathroom_floor", "climate.bathroom_floor_2")
+FLOOR_SETPOINT: Final = 20.0
+PROGRAM_PRESET: Final = "program"
+# The keys a room stored before floor heaters existed lacks.
+FLOOR_KEYS: Final = (
+    CONF_FLOOR_HEATERS,
+    CONF_FLOOR_MAX,
+    CONF_FLOOR_MIN,
+    CONF_FALLBACK_FLOOR_SETPOINT,
+    CONF_MIN_ON_TIME,
+)
 
 # (service, entity id, value) of a write that reached a TRV.
 type TrvCall = tuple[str, str, object]
@@ -210,6 +232,81 @@ class FakeSpiritClimate(ClimateEntity):
         self.async_write_ha_state()
 
 
+class FakeFloorClimate(ClimateEntity):
+    """A floor thermostat's climate entity that applies each write at once."""
+
+    _attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT]  # noqa: RUF012
+    _attr_preset_modes = [HOLD_PRESET, PROGRAM_PRESET]  # noqa: RUF012
+    _attr_supported_features = (
+        ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE
+    )
+    _attr_temperature_unit = UnitOfTemperature.CELSIUS
+    _attr_should_poll = False
+
+    def __init__(self, entity_id: str, calls: list[TrvCall]) -> None:
+        """Create the thermostat in heat mode and hold, at FLOOR_SETPOINT."""
+        self._calls = calls
+        self.entity_id = entity_id
+        self._attr_unique_id = entity_id
+        self._attr_hvac_mode = HVACMode.HEAT
+        self._attr_preset_mode = HOLD_PRESET
+        self._attr_target_temperature = FLOOR_SETPOINT
+
+    @override
+    async def async_set_preset_mode(self, preset_mode: str) -> None:
+        self._calls.append(("set_preset_mode", self.entity_id, preset_mode))
+        self._attr_preset_mode = preset_mode
+        self.async_write_ha_state()
+
+    @override
+    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        self._calls.append(("set_hvac_mode", self.entity_id, hvac_mode))
+        self._attr_hvac_mode = hvac_mode
+        self.async_write_ha_state()
+
+    @override
+    async def async_set_temperature(self, **kwargs: Any) -> None:
+        temperature = kwargs[ATTR_TEMPERATURE]
+        self._calls.append(("set_temperature", self.entity_id, temperature))
+        self._attr_target_temperature = temperature
+        self.async_write_ha_state()
+
+
+async def async_setup_floor_heaters(
+    hass: HomeAssistant, calls: list[TrvCall]
+) -> list[FakeFloorClimate]:
+    """
+    Set up a fake integration with the FLOOR_HEATERS.
+
+    Its config flow must be mocked. Also registers WALL_SENSOR, as
+    async_setup_spirits does.
+    """
+    register_sensor(hass, WALL_SENSOR)
+    entities = [FakeFloorClimate(entity_id, calls) for entity_id in FLOOR_HEATERS]
+
+    async def setup_climate(
+        _hass: HomeAssistant, _entry: ConfigEntry, add_entities: AddEntitiesCallback
+    ) -> None:
+        add_entities(entities)
+
+    async def setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+        await hass.config_entries.async_forward_entry_setups(entry, ["climate"])
+        return True
+
+    mock_integration(hass, MockModule(FLOOR_INTEGRATION, async_setup_entry=setup_entry))
+    mock_platform(hass, f"{FLOOR_INTEGRATION}.config_flow")
+    mock_platform(
+        hass,
+        f"{FLOOR_INTEGRATION}.climate",
+        MockPlatform(async_setup_entry=setup_climate),
+    )
+    floor_entry = MockConfigEntry(domain=FLOOR_INTEGRATION)
+    floor_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(floor_entry.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    return entities
+
+
 async def async_setup_spirits(
     hass: HomeAssistant,
     calls: list[TrvCall],
@@ -302,11 +399,21 @@ def registry_ids(hass: HomeAssistant, entity_ids: Sequence[str]) -> list[str]:
 
 
 def room_subentry(
-    subentry_id: str, title: str, *, sensors: Sequence[str], trvs: Sequence[str]
+    subentry_id: str,
+    title: str,
+    *,
+    sensors: Sequence[str],
+    trvs: Sequence[str] = (),
+    heaters: Sequence[str] = (),
 ) -> ConfigSubentryDataWithId:
     """Return a room subentry storing the given registry ids."""
     return ConfigSubentryDataWithId(
-        data=DEFAULT_ROOM | {CONF_SENSORS: list(sensors), CONF_TRVS: list(trvs)},
+        data=DEFAULT_ROOM
+        | {
+            CONF_SENSORS: list(sensors),
+            CONF_TRVS: list(trvs),
+            CONF_FLOOR_HEATERS: list(heaters),
+        },
         subentry_id=subentry_id,
         subentry_type=SUBENTRY_TYPE_ROOM,
         title=title,

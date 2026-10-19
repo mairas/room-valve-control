@@ -22,25 +22,35 @@
             "name": "Name",
             "sensors": "Wall temperature sensors",
             "trvs": "TRVs",
+            "floor_heaters": "Floor heaters",
             "kp": "Proportional gain (Kp)",
             "ti": "Integral time (Ti)",
             "control_step": "Control step",
             "min_change": "Minimum valve change",
             "stale_timeout": "Stale sensor timeout",
             "min_target": "Minimum target temperature",
-            "max_target": "Maximum target temperature"
+            "max_target": "Maximum target temperature",
+            "floor_max": "Floor maximum",
+            "floor_min": "Floor minimum",
+            "fallback_floor_setpoint": "Fallback floor setpoint",
+            "min_on_time": "Minimum on-time"
           },
           "data_description": {
             "name": "Name of the room and of its thermostat entity.",
             "sensors": "The room temperature is the mean of the sensors that have reported within the stale sensor timeout.",
-            "trvs": "Eurotronic Spirit TRVs. Each TRV's valve control and temperature offset (parameter 8) entities must be enabled. A TRV can belong to one room only.",
+            "trvs": "Eurotronic Spirit TRVs. Each TRV's valve control and temperature offset (parameter 8) entities must be enabled. A TRV can belong to one room only. Leave empty for a floor-heating room.",
+            "floor_heaters": "Floor-heating thermostats, instead of TRVs. Each heats for the valve output's share of every control step. A floor heater can belong to one room only.",
             "kp": "Valve change in % points per °C of control error.",
             "ti": "Time in which the integral term adds as much as the proportional term at a constant error.",
             "control_step": "How often the valve position is computed.",
             "min_change": "A TRV is written only when the computed position differs from its valve reading by at least this many % points. Above {endpoint_tolerance} and at most {valve_max}.",
             "stale_timeout": "When no wall sensor has reported for this long, the TRVs regulate on their own.",
             "min_target": "Lowest target temperature the room thermostat accepts.",
-            "max_target": "Highest target temperature the room thermostat accepts."
+            "max_target": "Highest target temperature the room thermostat accepts.",
+            "floor_max": "Floor setpoint written to switch the floor heating on. The thermostat itself keeps the floor at or below it. Floor heaters only.",
+            "floor_min": "Floor setpoint written to switch the floor heating off. The thermostat still heats a floor colder than this. Floor heaters only.",
+            "fallback_floor_setpoint": "Floor setpoint the thermostats hold on their own while the room is not controlled. Between the floor minimum and maximum. Floor heaters only.",
+            "min_on_time": "Shorter on- or off-times are dropped from a control step. At most half the control step. Floor heaters only."
           }
         },
         "reconfigure": {
@@ -49,32 +59,43 @@
             "name": "Name",
             "sensors": "Wall temperature sensors",
             "trvs": "TRVs",
+            "floor_heaters": "Floor heaters",
             "kp": "Proportional gain (Kp)",
             "ti": "Integral time (Ti)",
             "control_step": "Control step",
             "min_change": "Minimum valve change",
             "stale_timeout": "Stale sensor timeout",
             "min_target": "Minimum target temperature",
-            "max_target": "Maximum target temperature"
+            "max_target": "Maximum target temperature",
+            "floor_max": "Floor maximum",
+            "floor_min": "Floor minimum",
+            "fallback_floor_setpoint": "Fallback floor setpoint",
+            "min_on_time": "Minimum on-time"
           },
           "data_description": {
             "name": "Name of the room and of its thermostat entity.",
             "sensors": "The room temperature is the mean of the sensors that have reported within the stale sensor timeout.",
-            "trvs": "Eurotronic Spirit TRVs. Each TRV's valve control and temperature offset (parameter 8) entities must be enabled. A TRV can belong to one room only.",
+            "trvs": "Eurotronic Spirit TRVs. Each TRV's valve control and temperature offset (parameter 8) entities must be enabled. A TRV can belong to one room only. Leave empty for a floor-heating room.",
+            "floor_heaters": "Floor-heating thermostats, instead of TRVs. Each heats for the valve output's share of every control step. A floor heater can belong to one room only.",
             "kp": "Valve change in % points per °C of control error.",
             "ti": "Time in which the integral term adds as much as the proportional term at a constant error.",
             "control_step": "How often the valve position is computed.",
             "min_change": "A TRV is written only when the computed position differs from its valve reading by at least this many % points. Above {endpoint_tolerance} and at most {valve_max}.",
             "stale_timeout": "When no wall sensor has reported for this long, the TRVs regulate on their own.",
             "min_target": "Lowest target temperature the room thermostat accepts.",
-            "max_target": "Highest target temperature the room thermostat accepts."
+            "max_target": "Highest target temperature the room thermostat accepts.",
+            "floor_max": "Floor setpoint written to switch the floor heating on. The thermostat itself keeps the floor at or below it. Floor heaters only.",
+            "floor_min": "Floor setpoint written to switch the floor heating off. The thermostat still heats a floor colder than this. Floor heaters only.",
+            "fallback_floor_setpoint": "Floor setpoint the thermostats hold on their own while the room is not controlled. Between the floor minimum and maximum. Floor heaters only.",
+            "min_on_time": "Shorter on- or off-times are dropped from a control step. At most half the control step. Floor heaters only."
           }
         }
       },
       "error": {
         "no_sensor": "Select at least one wall temperature sensor.",
         "sensor_not_registered": "{sensor} has no unique ID, so the room could not find it again after a rename. Give it a unique ID or select another sensor.",
-        "no_trv": "Select at least one TRV.",
+        "no_trv_or_heater": "Select TRVs or floor heaters.",
+        "trvs_and_heaters": "A room has TRVs or floor heaters, not both.",
         "trv_in_use": "{trv} already belongs to the room {room}.",
         "trv_entity_missing": "{trv} is not usable: its {entity} entity was not found. Only Eurotronic Spirit TRVs on Z-Wave JS are supported.",
         "trv_entity_disabled": "{trv} is not usable: its {entity} entity {entity_id} is disabled. Enable it and try again.",
@@ -82,7 +103,13 @@
         "not_positive": "Must be greater than zero.",
         "not_finite": "Must be a finite number.",
         "min_change_out_of_range": "Must be above {endpoint_tolerance} and at most {valve_max} % points.",
-        "target_range_empty": "Must be greater than the minimum target temperature."
+        "target_range_empty": "Must be greater than the minimum target temperature.",
+        "heater_in_use": "{heater} already belongs to the room {room}.",
+        "heater_not_registered": "{heater} has no unique ID, so the room could not find it again after a rename. Give it a unique ID or select another thermostat.",
+        "heater_entity_disabled": "{heater} is disabled. Enable it and try again.",
+        "not_whole_degrees": "Must be a whole number of degrees.",
+        "floor_setpoints_out_of_order": "The floor minimum, fallback floor setpoint and floor maximum must rise in that order.",
+        "min_on_time_too_long": "Must be at most half the control step."
       },
       "abort": {
         "reconfigure_successful": "The room was reconfigured."
@@ -117,11 +144,15 @@
   "issues": {
     "unusable_trv": {
       "title": "TRV left out of {room}",
-      "description": "{trv} is not usable: {reason}. The room is controlled without it, and the TRV is left as it is. Fix the TRV, or reconfigure the room without it; this issue clears when the integration next reloads."
+      "description": "{device} is not usable: {reason}. The room is controlled without it, and the TRV is left as it is. Fix the TRV, or reconfigure the room without it; this issue clears when the integration next reloads."
     },
-    "room_without_trvs": {
+    "unusable_floor_heater": {
+      "title": "Floor heater left out of {room}",
+      "description": "{device} is not usable: {reason}. The room is controlled without it, and the floor heater is left as it is. Fix it, or reconfigure the room without it; this issue clears when the integration next reloads."
+    },
+    "room_without_devices": {
       "title": "{room} is not controlled",
-      "description": "None of the room's TRVs is usable, so the room is not set up and its entities are unavailable. Fix a TRV, or reconfigure the room; this issue clears when the integration next reloads."
+      "description": "None of the room's TRVs or floor heaters is usable, so the room is not set up and its entities are unavailable. Fix one, or reconfigure the room; this issue clears when the integration next reloads."
     }
   }
 }
