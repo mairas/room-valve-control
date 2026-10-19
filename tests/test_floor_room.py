@@ -16,9 +16,14 @@ from pytest_homeassistant_custom_component.common import mock_config_flow
 
 from custom_components.room_valve_control.const import (
     CONF_CONTROL_STEP,
+    CONF_FALLBACK_FLOOR_SETPOINT,
+    CONF_FLOOR_MAX,
+    CONF_FLOOR_MIN,
+    CONF_MIN_ON_TIME,
     DEFAULT_FALLBACK_FLOOR_SETPOINT,
     DEFAULT_FLOOR_MAX,
     DEFAULT_FLOOR_MIN,
+    DEFAULT_MIN_ON_TIME,
     DOMAIN,
     ISSUE_ROOM_WITHOUT_DEVICES,
     ISSUE_UNUSABLE_FLOOR_HEATER,
@@ -38,7 +43,7 @@ from .live_room import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Iterator, Mapping, Sequence
 
     from freezegun.api import FrozenDateTimeFactory
     from homeassistant.core import HomeAssistant
@@ -84,9 +89,15 @@ async def floor_calls(
 
 
 async def async_setup_floor_room(
-    hass: HomeAssistant, heaters: Sequence[str] | None = None
+    hass: HomeAssistant,
+    heaters: Sequence[str] | None = None,
+    parameters: Mapping[str, float] | None = None,
 ) -> MockConfigEntry:
-    """Add and set up the entry with the bathroom, heated by the floor."""
+    """
+    Add and set up the entry with the bathroom, heated by the floor.
+
+    parameters override the stored defaults and the 30 min control step.
+    """
     if heaters is None:
         heaters = registry_ids(hass, [HEATER])
     subentry = room_subentry(
@@ -95,9 +106,11 @@ async def async_setup_floor_room(
         sensors=registry_ids(hass, [WALL_SENSOR]),
         heaters=heaters,
     )
-    subentry["data"] = dict(subentry["data"]) | {
-        CONF_CONTROL_STEP: CONTROL_STEP.total_seconds()
-    }
+    subentry["data"] = (
+        dict(subentry["data"])
+        | {CONF_CONTROL_STEP: CONTROL_STEP.total_seconds()}
+        | dict(parameters or {})
+    )
     return await async_setup_rooms(hass, [subentry])
 
 
@@ -142,6 +155,40 @@ async def test_floor_heats_for_the_output_share_of_the_step(
     assert floor_calls == [setpoint(DEFAULT_FLOOR_MAX), setpoint(DEFAULT_FLOOR_MIN)]
     # The start fallback, the on edge and the off edge, before the next step.
     assert writes(hass) == "3"
+
+
+async def test_configured_floor_parameters_reach_the_thermostat(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, floor_calls: list[TrvCall]
+) -> None:
+    """The stored floor setpoints and minimum on-time are the ones written."""
+    hass.states.async_set(WALL_SENSOR, READING)
+    short_step = timedelta(minutes=10)
+    # 30 % of the 10 min step: shorter than the default minimum on-time, so
+    # only the configured one keeps the on-period.
+    short_on_time = timedelta(minutes=3)
+    min_on_time = timedelta(minutes=2)
+    assert min_on_time < short_on_time < DEFAULT_MIN_ON_TIME
+    await async_setup_floor_room(
+        hass,
+        parameters={
+            CONF_CONTROL_STEP: short_step.total_seconds(),
+            CONF_FLOOR_MAX: 28.0,
+            CONF_FLOOR_MIN: 15.0,
+            CONF_FALLBACK_FLOOR_SETPOINT: 21.0,
+            CONF_MIN_ON_TIME: min_on_time.total_seconds(),
+        },
+    )
+    assert floor_calls == [setpoint(21.0)]
+    floor_calls.clear()
+
+    await async_set_room_target(hass, TARGET, ROOM_CLIMATE)
+    assert floor_calls == [setpoint(28.0)]
+    await async_advance(hass, freezer, short_on_time - JUST_BEFORE)
+    assert floor_calls == [setpoint(28.0)]
+
+    await async_advance(hass, freezer, JUST_BEFORE)
+
+    assert floor_calls == [setpoint(28.0), setpoint(15.0)]
 
 
 async def test_reload_during_an_on_period_holds_the_fallback(
