@@ -347,6 +347,9 @@ def _heater_error(
             }
         if registry_entry.disabled:
             return "heater_entity_disabled", {"heater": heater}
+        # A room's thermostat would take the floor setpoints as its room target.
+        if registry_entry.platform == DOMAIN:
+            return "heater_is_room", {"heater": heater}
     return None
 
 

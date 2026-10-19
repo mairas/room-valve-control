@@ -63,6 +63,7 @@ HEATER_1: Final = "climate.bathroom_floor"
 HEATER_2: Final = "climate.hallway_floor"
 DISABLED_HEATER: Final = "climate.sauna_floor"
 UNREGISTERED_HEATER: Final = "climate.yaml_floor"
+ROOM_THERMOSTAT: Final = "climate.hall"
 ZERO_DURATION: Final = {"hours": 0, "minutes": 0, "seconds": 0}
 
 DEFAULT_PARAMETERS: Final = {
@@ -95,6 +96,7 @@ ERROR_KEYS: Final = (
     "heater_in_use",
     "heater_not_registered",
     "heater_entity_disabled",
+    "heater_is_room",
     "not_whole_degrees",
     "floor_setpoints_out_of_order",
     "min_on_time_too_long",
@@ -140,6 +142,12 @@ def registry_entries(hass: HomeAssistant) -> None:
         DISABLED_HEATER,
         suggested_object_id=DISABLED_HEATER.split(".", 1)[1],
         disabled_by=er.RegistryEntryDisabler.USER,
+    )
+    registry.async_get_or_create(
+        "climate",
+        DOMAIN,
+        "hall_room",
+        suggested_object_id=ROOM_THERMOSTAT.split(".", 1)[1],
     )
 
 
@@ -542,6 +550,10 @@ async def test_floor_parameters_are_stored(hass: HomeAssistant) -> None:
         (
             {CONF_FLOOR_HEATERS: [HEATER_1, UNREGISTERED_HEATER]},
             {CONF_FLOOR_HEATERS: "heater_not_registered"},
+        ),
+        (
+            {CONF_FLOOR_HEATERS: [ROOM_THERMOSTAT]},
+            {CONF_FLOOR_HEATERS: "heater_is_room"},
         ),
     ],
 )

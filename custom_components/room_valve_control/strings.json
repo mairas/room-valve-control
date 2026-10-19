@@ -107,6 +107,7 @@
         "heater_in_use": "{heater} already belongs to the room {room}.",
         "heater_not_registered": "{heater} has no unique ID, so the room could not find it again after a rename. Give it a unique ID or select another thermostat.",
         "heater_entity_disabled": "{heater} is disabled. Enable it and try again.",
+        "heater_is_room": "{heater} is the thermostat of a Room Valve Control room, not a floor-heating thermostat.",
         "not_whole_degrees": "Must be a whole number of degrees.",
         "floor_setpoints_out_of_order": "The floor minimum, fallback floor setpoint and floor maximum must rise in that order.",
         "min_on_time_too_long": "Must be at most half the control step."
