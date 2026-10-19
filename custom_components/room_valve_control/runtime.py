@@ -249,6 +249,11 @@ class RoomRuntime:
         """Return the room's TRVs by entity registry id."""
         return self._trvs
 
+    @property
+    def heats_floor(self) -> bool:
+        """Return whether floor heaters, not TRVs, heat the room."""
+        return bool(self._heaters)
+
     @callback
     def async_edge_written(self, sent: int) -> None:
         """Count the writes of a floor heater's timed off edge and show them."""

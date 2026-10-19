@@ -122,6 +122,9 @@
       "output": {
         "name": "Valve output"
       },
+      "duty_cycle": {
+        "name": "Duty cycle"
+      },
       "integrator": {
         "name": "Integrator"
       },

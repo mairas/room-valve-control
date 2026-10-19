@@ -1,6 +1,6 @@
 """Diagnostic sensors showing what a room's control is doing."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Final, override
 
 from homeassistant.components.sensor import (
@@ -79,9 +79,21 @@ async def async_setup_entry(
     """Add the diagnostic sensors of every room."""
     for subentry_id, runtime in entry.runtime_data.items():
         async_add_entities(
-            [RoomSensor(runtime, description) for description in SENSORS],
+            [
+                RoomSensor(runtime, _for_room(runtime, description))
+                for description in SENSORS
+            ],
             config_subentry_id=subentry_id,
         )
+
+
+def _for_room(
+    runtime: RoomRuntime, description: RoomSensorDescription
+) -> RoomSensorDescription:
+    """Name a floor room's output for what it drives, keeping its unique id."""
+    if description.key == "output" and runtime.heats_floor:
+        return replace(description, translation_key="duty_cycle")
+    return description
 
 
 class RoomSensor(SensorEntity):

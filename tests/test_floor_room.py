@@ -9,7 +9,7 @@ from homeassistant.config_entries import (
     ConfigEntryState,
     ConfigFlow,
 )
-from homeassistant.const import STATE_UNKNOWN
+from homeassistant.const import ATTR_FRIENDLY_NAME, STATE_UNKNOWN
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
 from pytest_homeassistant_custom_component.common import mock_config_flow
@@ -53,6 +53,7 @@ ROOM_ID: Final = "bathroom_subentry"
 ROOM_TITLE: Final = "Bathroom"
 ROOM_CLIMATE: Final = "climate.bathroom"
 WRITES_SENSOR: Final = "sensor.bathroom_device_writes"
+DUTY_CYCLE_SENSOR: Final = "sensor.bathroom_duty_cycle"
 HEATER: Final = FLOOR_HEATERS[0]
 CONTROL_STEP: Final = timedelta(minutes=30)
 TARGET: Final = 21.0
@@ -155,6 +156,20 @@ async def test_floor_heats_for_the_output_share_of_the_step(
     assert floor_calls == [setpoint(DEFAULT_FLOOR_MAX), setpoint(DEFAULT_FLOOR_MIN)]
     # The start fallback, the on edge and the off edge, before the next step.
     assert writes(hass) == "3"
+
+
+async def test_output_is_named_duty_cycle(
+    hass: HomeAssistant,
+    floor_calls: list[TrvCall],  # noqa: ARG001
+) -> None:
+    """A floor room's output is the share of each step the floor heats."""
+    hass.states.async_set(WALL_SENSOR, STATE_UNKNOWN)
+
+    await async_setup_floor_room(hass)
+
+    state = hass.states.get(DUTY_CYCLE_SENSOR)
+    assert state is not None
+    assert state.attributes[ATTR_FRIENDLY_NAME] == "Bathroom Duty cycle"
 
 
 async def test_configured_floor_parameters_reach_the_thermostat(
