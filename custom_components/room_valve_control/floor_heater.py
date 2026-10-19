@@ -62,11 +62,6 @@ class FloorHeater(Protocol):
     """
 
     @property
-    def name(self) -> str:
-        """Return a stable identifier for logs."""
-        ...
-
-    @property
     def available(self) -> bool:
         """Return whether the device can be read and written."""
         ...
@@ -87,10 +82,6 @@ class FloorHeater(Protocol):
 
         The thermostat then regulates the floor on its own.
         """
-        ...
-
-    async def cancel_edge(self) -> None:
-        """Drop the pending off edge, and wait for one already being written."""
         ...
 
 

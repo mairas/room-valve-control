@@ -1313,15 +1313,8 @@ OWN_FALLBACK_SETPOINT: Final = 24.0
 class FakeFloorHeater:
     """A floor heater that records its calls and keeps the off edge it owes."""
 
-    def __init__(
-        self,
-        *,
-        name: str = "climate.floor",
-        available: bool = True,
-        sends: bool = True,
-    ) -> None:
+    def __init__(self, *, available: bool = True, sends: bool = True) -> None:
         """Create a heater in the given state."""
-        self.name = name
         self.available = available
         self.sends = sends
         # When the off edge of the running period is due, None without one.
@@ -1339,7 +1332,7 @@ class FakeFloorHeater:
 
     async def apply_duty(self, output: float, period: timedelta, now: datetime) -> int:
         """Record the period start and owe an off edge inside the period."""
-        await self.cancel_edge()
+        self.pending_off = None
         self.calls.append(("duty", output, period, now))
         await self._wait_for_gate()
         if 0 < output < PERCENT:
@@ -1348,14 +1341,10 @@ class FakeFloorHeater:
 
     async def hold_setpoint(self, setpoint: float) -> int:
         """Drop the owed off edge, then record the setpoint."""
-        await self.cancel_edge()
+        self.pending_off = None
         self.calls.append(("hold", setpoint))
         await self._wait_for_gate()
         return int(self.sends and self.available)
-
-    async def cancel_edge(self) -> None:
-        """Drop the owed off edge."""
-        self.pending_off = None
 
     def fire_edge(self) -> bool:
         """Write the owed off edge as the timer would; return whether one was owed."""

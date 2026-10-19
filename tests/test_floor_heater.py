@@ -122,7 +122,7 @@ async def heater(
 async def test_implements_protocol(heater: ClimateFloorHeater) -> None:
     """The adapter is a FloorHeater."""
     device: FloorHeater = heater
-    assert device.name == CLIMATE_ID
+    assert device.available
 
 
 async def test_unknown_entity_fails(hass: HomeAssistant) -> None:
