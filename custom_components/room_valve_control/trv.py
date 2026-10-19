@@ -1,7 +1,11 @@
 """The device-facing interface a room uses to drive its TRVs."""
 
+from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 
 class TrvMode(StrEnum):
@@ -10,6 +14,14 @@ class TrvMode(StrEnum):
     DIRECT = "direct"
     SELF_REGULATING = "self_regulating"
     UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class Press:
+    """A setpoint set on the device itself, and when the device reported it."""
+
+    setpoint: float
+    at: datetime
 
 
 # A Protocol rather than an ABC: implementations share no code, and the room's
@@ -49,6 +61,21 @@ class Trv(Protocol):
         ...
 
     @property
+    def pressed(self) -> Press | None:
+        """
+        Return the latest setpoint set on the device itself, until cleared.
+
+        A press is a change of the self-regulation setpoint made on the
+        device: not the setpoint it enters self-regulation with, and not the
+        read-back of one enter_self_regulation wrote. None when there is none.
+        """
+        ...
+
+    def clear_press(self) -> None:
+        """Forget the press, so that pressed is None until the next one."""
+        ...
+
+    @property
     def valve(self) -> float | None:
         """Return the valve position the device reports, in %."""
         ...
@@ -77,9 +104,10 @@ class Trv(Protocol):
         """
         Switch to self-regulation at setpoint; return the writes sent.
 
-        Writes only the parts (mode, setpoint) that differ from what the TRV
-        reports. A setpoint left pending after a mode change is written on the
-        next call; the room calls this on every fallback step.
+        The setpoint may be rounded to what the device can hold. Writes only
+        the parts (mode, setpoint) that differ from what the TRV reports. A
+        setpoint left pending after a mode change is written on the next call;
+        the room calls this on every fallback step.
 
         With force_mode the mode write is sent even if the TRV already reads
         self-regulating, and the setpoint is then written without comparing.

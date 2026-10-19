@@ -4,16 +4,15 @@ import asyncio
 import logging
 import math
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
 from .controller import PIController, should_write_valve
-from .trv import Trv, TrvMode
+from .trv import Press, Trv, TrvMode
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from datetime import datetime
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -77,6 +76,8 @@ class Room:
         self._device_writes = device_writes
         self._mode = ControlMode.WAITING
         self._target: float | None = None
+        # When the target last changed; a press must be later to be adopted.
+        self._target_set_at = started_at
         self._last_output: int | None = None
         self._last_error: float | None = None
         self._last_direct_step: datetime | None = None
@@ -146,9 +147,9 @@ class Room:
             and self.current_reading(now, readings) is not None
         )
 
-    async def set_target(self, target: float) -> None:
+    async def set_target(self, target: float, now: datetime) -> None:
         """
-        Set the target at once; in fallback, also write it to the TRVs.
+        Set the target at once, as of now; in fallback, also write it.
 
         A stopped room only records it, for the next room to start from.
         Only the fallback write waits for an operation in progress, and it
@@ -157,6 +158,7 @@ class Room:
         fallback no write is needed.
         """
         self._target = target
+        self._target_set_at = now
         if self._mode is not ControlMode.FALLBACK:
             return
         async with self._lock:
@@ -201,6 +203,7 @@ class Room:
     async def _step(self, now: datetime, readings: Sequence[Reading]) -> None:
         if self._target is None:
             return
+        self._adopt_press()
         reading = self.current_reading(now, readings)
         if reading is not None:
             await self._step_direct(now, self._target, reading)
@@ -212,6 +215,34 @@ class Room:
         self._last_output = None
         self._last_error = None
         await self._self_regulate(self._target)
+
+    def _adopt_press(self) -> None:
+        """
+        Take the newest setpoint set on a TRV as the target.
+
+        Only a press later than the last target change counts, so every press
+        seen is spent. Adopting one is itself a target change.
+        """
+        presses: list[tuple[Trv, Press]] = []
+        for trv in self._trvs:
+            pressed = trv.pressed
+            if pressed is None or not trv.available:
+                continue
+            trv.clear_press()
+            # The press is why it left direct mode: no warning on re-entering.
+            self._directed.discard(trv)
+            presses.append((trv, pressed))
+        if not presses:
+            return
+        trv, pressed = max(presses, key=lambda p: p[1].at)
+        if pressed.at <= self._target_set_at:
+            return
+        self._target_set_at = pressed.at
+        if pressed.setpoint != self._target:
+            _LOGGER.info(
+                "%s: target %s from %s", self._name, pressed.setpoint, trv.name
+            )
+            self._target = pressed.setpoint
 
     async def _step_direct(self, now: datetime, target: float, reading: float) -> None:
         self._mode = ControlMode.DIRECT

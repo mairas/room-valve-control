@@ -6,9 +6,15 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Final
 
 import pytest
-from homeassistant.const import EVENT_STATE_CHANGED, STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.const import (
+    ATTR_TEMPERATURE,
+    EVENT_STATE_CHANGED,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+)
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
+from homeassistant.util import dt as dt_util
 
 from custom_components.room_valve_control import spirit
 from custom_components.room_valve_control.spirit import (
@@ -17,7 +23,7 @@ from custom_components.room_valve_control.spirit import (
     SpiritEntityError,
     SpiritTrv,
 )
-from custom_components.room_valve_control.trv import TrvMode
+from custom_components.room_valve_control.trv import Press, TrvMode
 
 from .helpers import (
     COMMAND_CLASS_CONFIGURATION,
@@ -34,7 +40,8 @@ from .helpers import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
+    from datetime import datetime
 
     from freezegun.api import FrozenDateTimeFactory
     from homeassistant.core import HomeAssistant, ServiceCall
@@ -542,6 +549,33 @@ async def test_setpoint_matches_within_half_a_step(
 
 
 @pytest.mark.usefixtures("full_spirit")
+@pytest.mark.parametrize(
+    ("requested", "step", "written"),
+    [
+        (21.3, None, 21.5),
+        (21.7, None, 21.5),
+        (21.25, None, 21.5),
+        (21.75, None, 22.0),
+        (21.3, 0.1, 21.3),
+        (21.34, 0.1, 21.3),
+    ],
+)
+async def test_setpoint_is_written_on_the_step(
+    hass: HomeAssistant,
+    calls: list[ServiceCall],
+    requested: float,
+    step: float | None,
+    written: float,
+) -> None:
+    """The setpoint written is the nearest step, a half step rounding up."""
+    set_climate(hass, "heat", setpoint=19.0, step=step)
+    trv = SpiritTrv(hass, CLIMATE_ID)
+
+    assert await trv.enter_self_regulation(requested) == 1
+    assert [c.data[ATTR_TEMPERATURE] for c in calls] == [pytest.approx(written)]
+
+
+@pytest.mark.usefixtures("full_spirit")
 async def test_enter_direct_sets_manufacturer_preset(
     hass: HomeAssistant, calls: list[ServiceCall]
 ) -> None:
@@ -556,6 +590,398 @@ async def test_enter_direct_sets_manufacturer_preset(
             {"entity_id": CLIMATE_ID, "preset_mode": "Manufacturer specific"},
         )
     ]
+
+
+@pytest.fixture
+def listening(
+    hass: HomeAssistant, full_spirit: Spirit, calls: list[ServiceCall]
+) -> Iterator[SpiritTrv]:
+    """Return an adapter recording presses, at heat 21.0 °C."""
+    del full_spirit, calls
+    trv = SpiritTrv(hass, CLIMATE_ID)
+    trv.start_listening()
+    yield trv
+    trv.stop_listening()
+
+
+def report(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, setpoint: float | None
+) -> datetime:
+    """Report heat at setpoint a minute on; return when."""
+    freezer.tick(timedelta(minutes=1))
+    set_climate(hass, "heat", setpoint=setpoint)
+    return dt_util.utcnow()
+
+
+def leave_direct(hass: HomeAssistant, freezer: FrozenDateTimeFactory) -> None:
+    """Report mode 31, then heat at the TRV's stored 21.0 °C, as a press does."""
+    set_climate(hass, STATE_UNKNOWN, preset=DIRECT_MODE_PRESET, setpoint=None)
+    report(hass, freezer, 21.0)
+
+
+async def test_setpoint_changed_after_leaving_direct_is_a_press(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, listening: SpiritTrv
+) -> None:
+    """The stored setpoint the TRV leaves mode 31 with is not; the next one is."""
+    leave_direct(hass, freezer)
+    assert listening.pressed is None
+
+    pressed_at = report(hass, freezer, 22.5)
+
+    assert listening.pressed == Press(22.5, pressed_at)
+
+
+async def test_temperature_report_is_no_press(
+    hass: HomeAssistant, listening: SpiritTrv
+) -> None:
+    """A report with the setpoint unchanged is not a press."""
+    set_climate(hass, "heat", setpoint=21.0, current=CURRENT_TEMPERATURE + 1)
+
+    assert listening.pressed is None
+
+
+@pytest.mark.parametrize("before", [STATE_UNAVAILABLE, "off"])
+async def test_setpoint_on_entering_heat_is_no_press(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    listening: SpiritTrv,
+    before: str,
+) -> None:
+    """Whatever the TRV comes from, the setpoint it enters heat with is stored."""
+    set_climate(hass, before, setpoint=19.0)
+    report(hass, freezer, 22.5)
+
+    assert listening.pressed is None
+
+
+async def test_setpoint_appearing_is_no_press(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, listening: SpiritTrv
+) -> None:
+    """A heat report gaining the setpoint it lacked has not changed it."""
+    report(hass, freezer, None)
+    report(hass, freezer, 22.5)
+
+    assert listening.pressed is None
+
+
+async def test_latest_press_is_kept_until_cleared(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, listening: SpiritTrv
+) -> None:
+    """Of a series of presses the last is recorded; clearing forgets it."""
+    report(hass, freezer, 21.5)
+    pressed_at = report(hass, freezer, 22.0)
+    assert listening.pressed == Press(22.0, pressed_at)
+
+    listening.clear_press()
+
+    assert listening.pressed is None
+
+
+async def test_written_setpoint_reading_back_is_no_press(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, listening: SpiritTrv
+) -> None:
+    """
+    After the write reads back, a return to the old setpoint is a press.
+
+    Nothing is read in between: the read-back is recorded as it arrives.
+    """
+    report(hass, freezer, 20.0)
+    listening.clear_press()
+    assert await listening.enter_self_regulation(21.0) == 1
+
+    report(hass, freezer, 21.0)
+    assert listening.pressed is None
+    pressed_at = report(hass, freezer, 20.0)
+
+    assert listening.pressed == Press(20.0, pressed_at)
+
+
+async def test_off_step_setpoint_reading_back_is_no_press(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, listening: SpiritTrv
+) -> None:
+    """A setpoint off the step reads back as the step it was written as."""
+    assert await listening.enter_self_regulation(21.3) == 1
+
+    report(hass, freezer, 21.5)
+
+    assert listening.pressed is None
+
+
+def unknown_setpoint_writes(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    """Make setpoint writes time out or be cancelled by zwave_js."""
+    monkeypatch.setattr(spirit, "SERVICE_TIMEOUT", 0.01)
+
+    async def stall(_call: ServiceCall) -> None:
+        # The frozen clock reaches the timeout only when ticked.
+        freezer.tick(1)
+        await asyncio.Event().wait()
+
+    handler = stall if outcome == "timed out" else cancelled_command
+    hass.services.async_register("climate", "set_temperature", handler)
+
+
+@pytest.mark.parametrize("outcome", ["timed out", "cancelled by zwave_js"])
+async def test_setpoint_write_of_unknown_outcome_landing_late_is_no_press(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    listening: SpiritTrv,
+    outcome: str,
+) -> None:
+    """A write that may still reach the node reads back as the room's own."""
+    unknown_setpoint_writes(hass, freezer, monkeypatch, outcome)
+    assert await listening.enter_self_regulation(22.0) == 0
+
+    report(hass, freezer, 22.0)
+
+    assert listening.pressed is None
+
+
+async def test_superseded_write_reading_back_late_is_no_press(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, listening: SpiritTrv
+) -> None:
+    """
+    Every write since the last confirmed one reads back as the room's own.
+
+    Once the latest has read back, an earlier value is a press again.
+    """
+    assert await listening.enter_self_regulation(20.5) == 1
+    assert await listening.enter_self_regulation(20.0) == 1
+
+    report(hass, freezer, 20.5)
+    report(hass, freezer, 20.0)
+    assert listening.pressed is None
+    pressed_at = report(hass, freezer, 20.5)
+
+    assert listening.pressed == Press(20.5, pressed_at)
+
+
+async def test_timed_out_write_landing_during_the_next_is_no_press(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    listening: SpiritTrv,
+) -> None:
+    """A timed-out write landing during the next one reads back as the room's own."""
+    unknown_setpoint_writes(hass, freezer, monkeypatch, "timed out")
+    assert await listening.enter_self_regulation(20.5) == 0
+
+    async def land_the_earlier_write(_call: ServiceCall) -> None:
+        report(hass, freezer, 20.5)
+
+    hass.services.async_register("climate", "set_temperature", land_the_earlier_write)
+    assert await listening.enter_self_regulation(20.0) == 1
+
+    report(hass, freezer, 20.0)
+    assert listening.pressed is None
+    pressed_at = report(hass, freezer, 20.5)
+
+    assert listening.pressed == Press(20.5, pressed_at)
+
+
+async def test_read_back_confirms_the_writes_before_it(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    listening: SpiritTrv,
+) -> None:
+    """A write reading back means every earlier one has landed or failed."""
+    unknown_setpoint_writes(hass, freezer, monkeypatch, "timed out")
+    for setpoint in (22.0, 20.5, 20.0):
+        assert await listening.enter_self_regulation(setpoint) == 0
+
+    report(hass, freezer, 20.5)
+    assert listening.pressed is None
+    pressed_at = report(hass, freezer, 22.0)
+
+    assert listening.pressed == Press(22.0, pressed_at)
+
+
+async def test_write_of_the_reported_setpoint_is_confirmed_at_once(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, listening: SpiritTrv
+) -> None:
+    """A forced write of the setpoint the TRV reports has no read-back to wait for."""
+    assert await listening.enter_self_regulation(21.0, force_mode=True) == 2  # noqa: PLR2004
+    report(hass, freezer, 22.0)
+
+    pressed_at = report(hass, freezer, 21.0)
+
+    assert listening.pressed == Press(21.0, pressed_at)
+
+
+async def test_other_setpoint_during_a_write_is_a_press(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, listening: SpiritTrv
+) -> None:
+    """A setpoint the room has not written is a press, write in flight or not."""
+    assert await listening.enter_self_regulation(20.0) == 1
+
+    pressed_at = report(hass, freezer, 22.0)
+
+    assert listening.pressed == Press(22.0, pressed_at)
+
+
+async def test_write_not_sent_is_not_awaited(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, listening: SpiritTrv
+) -> None:
+    """A setpoint whose write failed is a press when someone sets it."""
+
+    async def fail(_call: ServiceCall) -> None:
+        msg = "asleep"
+        raise HomeAssistantError(msg)
+
+    hass.services.async_register("climate", "set_temperature", fail)
+    assert await listening.enter_self_regulation(20.0) == 0
+
+    pressed_at = report(hass, freezer, 20.0)
+
+    assert listening.pressed == Press(20.0, pressed_at)
+
+
+async def test_write_failing_after_its_value_reported_does_not_raise(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, listening: SpiritTrv
+) -> None:
+    """A report of the value during a write that then fails is no press."""
+
+    async def report_then_fail(_call: ServiceCall) -> None:
+        report(hass, freezer, 20.0)
+        msg = "asleep"
+        raise HomeAssistantError(msg)
+
+    hass.services.async_register("climate", "set_temperature", report_then_fail)
+
+    assert await listening.enter_self_regulation(20.0) == 0
+    assert listening.pressed is None
+
+
+async def test_mode_31_report_drops_unconfirmed_writes(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    listening: SpiritTrv,
+) -> None:
+    """
+    A write still unconfirmed when the room enters direct mode reads back.
+
+    The node gets its commands in order, so by the time it reports mode 31
+    the write has landed or failed: a press to its value is then a press.
+    """
+    unknown_setpoint_writes(hass, freezer, monkeypatch, "timed out")
+    assert await listening.enter_self_regulation(22.0) == 0
+    assert await listening.enter_direct()
+
+    report(hass, freezer, 22.0)
+    assert listening.pressed is None
+
+    leave_direct(hass, freezer)
+    pressed_at = report(hass, freezer, 22.0)
+
+    assert listening.pressed == Press(22.0, pressed_at)
+
+
+async def test_mode_31_report_drops_writes_that_never_landed(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    listening: SpiritTrv,
+) -> None:
+    """A write that never read back stops masking a press after mode 31."""
+    unknown_setpoint_writes(hass, freezer, monkeypatch, "timed out")
+    assert await listening.enter_self_regulation(22.0) == 0
+
+    leave_direct(hass, freezer)
+    pressed_at = report(hass, freezer, 22.0)
+
+    assert listening.pressed == Press(22.0, pressed_at)
+
+
+async def test_repeated_write_reads_back_once(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    listening: SpiritTrv,
+) -> None:
+    """A write retried while unconfirmed is confirmed by its one read-back."""
+    unknown_setpoint_writes(hass, freezer, monkeypatch, "timed out")
+    assert await listening.enter_self_regulation(22.0) == 0
+    assert await listening.enter_self_regulation(22.0) == 0
+
+    report(hass, freezer, 22.0)
+    report(hass, freezer, 20.5)
+    listening.clear_press()
+    pressed_at = report(hass, freezer, 22.0)
+
+    assert listening.pressed == Press(22.0, pressed_at)
+
+
+async def test_presses_are_recorded_only_while_listening(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, listening: SpiritTrv
+) -> None:
+    """Stopping unsubscribes; starting twice subscribes once."""
+    listening.stop_listening()
+    report(hass, freezer, 22.0)
+    assert listening.pressed is None
+
+    listening.start_listening()
+    listening.start_listening()
+    listening.stop_listening()
+    report(hass, freezer, 22.5)
+
+    assert listening.pressed is None
+
+
+async def test_write_unheard_before_listening_masks_no_press(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, listening: SpiritTrv
+) -> None:
+    """A hand back's write that reads back unheard is forgotten on restarting."""
+    listening.stop_listening()
+    assert await listening.enter_self_regulation(22.0) == 1
+    report(hass, freezer, 22.0)
+    listening.start_listening()
+
+    report(hass, freezer, 20.0)
+    pressed_at = report(hass, freezer, 22.0)
+
+    assert listening.pressed == Press(22.0, pressed_at)
+
+
+async def test_rename_keeps_unconfirmed_writes(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    full_spirit: Spirit,
+    listening: SpiritTrv,
+) -> None:
+    """A write reading back under the climate entity's new id is no press."""
+    assert await listening.enter_self_regulation(22.0) == 1
+    renamed = "climate.renamed"
+    full_spirit.entity_registry.async_update_entity(CLIMATE_ID, new_entity_id=renamed)
+    await hass.async_block_till_done()
+    hass.states.async_set(renamed, "heat", {"temperature": 21.0})
+    freezer.tick(timedelta(minutes=1))
+    hass.states.async_set(renamed, "heat", {"temperature": 22.0})
+
+    assert listening.pressed is None
+
+
+async def test_presses_follow_a_rename_while_listening(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    full_spirit: Spirit,
+    listening: SpiritTrv,
+) -> None:
+    """A climate entity given a new id is listened to under it."""
+    renamed = "climate.renamed"
+    full_spirit.entity_registry.async_update_entity(CLIMATE_ID, new_entity_id=renamed)
+    await hass.async_block_till_done()
+    hass.states.async_set(renamed, "heat", {"temperature": 21.0})
+    freezer.tick(timedelta(minutes=1))
+    hass.states.async_set(renamed, "heat", {"temperature": 22.0})
+
+    assert listening.pressed == Press(22.0, dt_util.utcnow())
 
 
 @pytest.mark.usefixtures("full_spirit")

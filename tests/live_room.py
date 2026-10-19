@@ -135,6 +135,19 @@ class FakeSpiritClimate(ClimateEntity):
         """Put the TRV in mode 31, as an earlier run left it."""
         self._apply_preset(DIRECT_MODE_PRESET)
 
+    def press(self, setpoint: float) -> None:
+        """
+        Set the setpoint on the TRV by hand, reported as a Spirit reports it.
+
+        The TRV leaves mode 31 for heat at its stored setpoint first, and
+        reports the setpoint chosen afterwards.
+        """
+        self._attr_hvac_mode = HVACMode.HEAT
+        self._attr_preset_mode = PRESET_NONE
+        self.async_write_ha_state()
+        self._attr_target_temperature = setpoint
+        self.async_write_ha_state()
+
     def set_available(self, *, available: bool) -> None:
         """Make the TRV's climate entity available or unavailable."""
         self._attr_available = available

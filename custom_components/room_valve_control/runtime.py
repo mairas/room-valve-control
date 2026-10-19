@@ -159,18 +159,21 @@ class RoomRuntime:
     ) -> None:
         """Create the room from restored values, start stepping and step once."""
         controller = self._restore_controller(controller_state)
+        started_at = dt_util.utcnow()
         room = Room(
             self._settings,
             list(self._trvs.values()),
             controller,
-            dt_util.utcnow(),
+            started_at,
             name=self.name,
             device_writes=device_writes,
         )
         if target is not None:
             # A waiting room only stores the target.
-            await room.set_target(target)
+            await room.set_target(target, started_at)
         self.room = room
+        for trv in self._trvs.values():
+            trv.start_listening()
         self._unsubscribes = [
             async_track_time_interval(
                 self._hass,
@@ -217,7 +220,7 @@ class RoomRuntime:
         """Set the room's target; step at once if the room has not run with one."""
         if self.room is None:
             return
-        await self.room.set_target(target)
+        await self.room.set_target(target, dt_util.utcnow())
         self._notify()
         self._schedule_step(lambda _now, _readings: not self._stepped_with_target)
 
@@ -253,6 +256,9 @@ class RoomRuntime:
         for unsubscribe in self._unsubscribes:
             unsubscribe()
         self._unsubscribes = []
+        # The adapters outlive a reload; the next room starts them again.
+        for trv in self._trvs.values():
+            trv.stop_listening()
         # Cancelling releases the room's lock to whatever waits next.
         steps = set(self._step_tasks)
         for step in steps:

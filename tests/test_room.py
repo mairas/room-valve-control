@@ -16,7 +16,7 @@ from custom_components.room_valve_control.room import (
     Room,
     RoomSettings,
 )
-from custom_components.room_valve_control.trv import TrvMode
+from custom_components.room_valve_control.trv import Press, TrvMode
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -65,6 +65,7 @@ class FakeTrv:
         self.available = available
         self.mode = mode
         self.setpoint = setpoint
+        self.pressed: Press | None = None
         self.valve = valve
         self.own_temperature = own_temperature
         self.offset = offset
@@ -81,6 +82,10 @@ class FakeTrv:
         if self.gate is not None:
             self.suspended.set()
             await self.gate.wait()
+
+    def clear_press(self) -> None:
+        """Forget the press."""
+        self.pressed = None
 
     async def enter_direct(self) -> bool:
         """Record the mode write."""
@@ -182,7 +187,7 @@ def clear(*trvs: FakeTrv) -> None:
 
 async def go_direct(room: Room, *trvs: FakeTrv, reading: float = 20.0) -> datetime:
     """Set the target and run a direct step at START; return its time."""
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
     await room.step(START, fresh(reading, START))
     clear(*trvs)
     return START
@@ -199,7 +204,7 @@ async def test_fresh_reading_below_target_enters_direct_and_writes_valve() -> No
     """The first direct step selects direct mode and writes the rounded output."""
     trv = FakeTrv(valve=0.0)
     room = make_room([trv])
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
 
     await room.step(START, fresh(20.49, START))
 
@@ -216,7 +221,7 @@ async def test_entering_direct_writes_valve_despite_matching_readback() -> None:
     """On entering mode 31 the valve takes its last mode-31 value; the readback lags."""
     trv = FakeTrv(valve=15.0)
     room = make_room([trv])
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
 
     await room.step(START, fresh(20.49, START))
 
@@ -227,7 +232,7 @@ async def test_small_error_writes_nothing_until_output_moves_by_min_change() -> 
     """A 0.1 °C error only writes once the integrator moves the output 5 %."""
     trv = FakeTrv(mode=TrvMode.DIRECT, valve=40.0)
     room = make_room([trv], integral=40.0)
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
 
     outputs: list[int | None] = []
     for step in range(20):
@@ -312,7 +317,7 @@ async def test_valve_without_readback_is_written() -> None:
     """A TRV whose valve reads back nothing gets the output."""
     trv = FakeTrv(mode=TrvMode.DIRECT, valve=None)
     room = make_room([trv], integral=40.0)
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
 
     await room.step(START, fresh(TARGET, START))
 
@@ -326,7 +331,7 @@ async def test_target_change_in_fallback_is_written_immediately() -> None:
     await go_direct(room, trv)
     await go_fallback(room, trv, now=at(90))
 
-    await room.set_target(22.5)
+    await room.set_target(22.5, START)
 
     assert trv.calls == [("setpoint", 22.5)]
     assert room.target == 22.5  # noqa: PLR2004
@@ -338,7 +343,7 @@ async def test_target_change_in_direct_takes_effect_at_next_step() -> None:
     room = make_room([trv])
     await go_direct(room, trv)
 
-    await room.set_target(22.0)
+    await room.set_target(22.0, START)
     assert trv.calls == []
 
     await room.step(at(15), fresh(20.0, at(15)))
@@ -349,7 +354,7 @@ async def test_target_is_stored_exactly() -> None:
     """The room echoes the exact value it was given."""
     room = make_room([FakeTrv()])
 
-    await room.set_target(20.123)
+    await room.set_target(20.123, START)
 
     assert room.target == 20.123  # noqa: PLR2004
 
@@ -358,7 +363,7 @@ async def test_one_of_three_trvs_unavailable_is_left_alone() -> None:
     """The available TRVs are controlled; nothing is sent to the other."""
     trvs = [FakeTrv(valve=0.0), FakeTrv(available=False), FakeTrv(valve=0.0)]
     room = make_room(trvs)
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
 
     await room.step(START, fresh(20.0, START))
 
@@ -371,7 +376,7 @@ async def test_all_trvs_unavailable_freezes_integrator() -> None:
     """With no TRV reachable the integrator does not move."""
     trvs = [FakeTrv(available=False), FakeTrv(available=False)]
     room = make_room(trvs, integral=20.0)
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
 
     for step in range(4):
         now = at(step * 15)
@@ -464,10 +469,244 @@ async def test_trv_back_from_unavailable_in_self_regulation(
     assert len(warnings(caplog)) == (1 if directed else 0)
 
 
+def infos(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return the messages captured at info level."""
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+
+
+def press(trv: FakeTrv, setpoint: float, minutes: float = 10) -> None:
+    """Set the TRV's setpoint by hand at minutes, which leaves mode 31."""
+    trv.mode = TrvMode.SELF_REGULATING
+    trv.setpoint = setpoint
+    trv.pressed = Press(setpoint, at(minutes))
+
+
+async def test_setpoint_set_on_a_direct_trv_becomes_the_target(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The room adopts it, puts the TRV back in direct mode and steps against it."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    press(trv, OTHER_TARGET)
+
+    with caplog.at_level(logging.INFO):
+        await room.step(at(15), fresh(20.0, at(15)))
+
+    assert room.target == OTHER_TARGET
+    assert room.last_error == pytest.approx(OTHER_TARGET - 20.0)
+    assert trv.calls[0] == ("direct",)
+    assert trv.pressed is None
+    assert room.control_mode is ControlMode.DIRECT
+    assert warnings(caplog) == []
+    assert infos(caplog) == [f"living room: target {OTHER_TARGET} from climate.trv"]
+
+
+async def test_press_on_a_trv_direct_before_the_room_started_is_adopted() -> None:
+    """After a restart the TRVs are already in mode 31; a press still counts."""
+    trv = FakeTrv(mode=TrvMode.DIRECT, valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    press(trv, OTHER_TARGET)
+
+    await room.step(at(15), fresh(20.0, at(15)))
+
+    assert room.target == OTHER_TARGET
+    assert trv.calls[0] == ("direct",)
+
+
+async def test_direct_trv_out_without_a_press_is_not_adopted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A TRV in heat at its stored setpoint, nobody having changed it, is re-entered."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    trv.mode = TrvMode.SELF_REGULATING
+    trv.setpoint = OTHER_TARGET
+
+    with caplog.at_level(logging.WARNING):
+        await room.step(at(15), fresh(20.0, at(15)))
+
+    assert room.target == TARGET
+    assert trv.calls[0] == ("direct",)
+    assert len(warnings(caplog)) == 1
+
+
+async def test_target_set_after_a_press_wins() -> None:
+    """A press older than the room's last target change is dropped."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    press(trv, OTHER_TARGET, minutes=10)
+    await room.set_target(LATEST_TARGET, at(12))
+
+    await room.step(at(15), fresh(20.0, at(15)))
+
+    assert room.target == LATEST_TARGET
+    assert trv.pressed is None
+
+
+async def test_press_from_before_the_room_started_is_dropped() -> None:
+    """A restored target counts as set when the room starts."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    press(trv, OTHER_TARGET, minutes=-5)
+
+    await go_direct(room, trv)
+
+    assert room.target == TARGET
+
+
+async def test_press_at_the_target_changes_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Pressing back to the target is adopted without a log line."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    press(trv, TARGET)
+
+    with caplog.at_level(logging.INFO):
+        await room.step(at(15), fresh(20.0, at(15)))
+
+    assert room.target == TARGET
+    assert trv.pressed is None
+    assert infos(caplog) == []
+    assert warnings(caplog) == []
+
+
+async def test_unavailable_trv_is_not_adopted() -> None:
+    """A TRV that cannot be read gives the room no setpoint."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    press(trv, OTHER_TARGET)
+    trv.available = False
+
+    await room.step(at(15), fresh(20.0, at(15)))
+
+    assert room.target == TARGET
+
+
+async def test_adopted_press_counts_as_the_last_target_change() -> None:
+    """A press older than the one adopted, seen only later, is dropped."""
+    late = FakeTrv(name="climate.window", valve=0.0)
+    pressed = FakeTrv(name="climate.door", valve=0.0)
+    room = make_room([late, pressed])
+    await go_direct(room, late, pressed)
+    press(late, LATEST_TARGET, minutes=5)
+    late.available = False
+    press(pressed, OTHER_TARGET, minutes=10)
+    await room.step(at(15), fresh(20.0, at(15)))
+    late.available = True
+
+    await room.step(at(30), fresh(20.0, at(30)))
+
+    assert room.target == OTHER_TARGET
+
+
+async def test_fallback_trv_without_a_press_is_not_adopted() -> None:
+    """A TRV reporting no setpoint of its own leaves the target as it is."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    await go_fallback(room, trv, now=at(90))
+
+    await room.step(at(105), [])
+
+    assert room.target == TARGET
+    assert trv.calls == []
+
+
+async def test_setpoint_set_on_a_fallback_trv_goes_to_the_others(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The room adopts it and writes it to its other TRVs."""
+    pressed = FakeTrv(name="climate.window", valve=0.0)
+    other = FakeTrv(name="climate.door", valve=0.0)
+    room = make_room([pressed, other])
+    await go_direct(room, pressed, other)
+    await go_fallback(room, pressed, other, now=at(90))
+    press(pressed, OTHER_TARGET, minutes=100)
+
+    with caplog.at_level(logging.INFO):
+        await room.step(at(105), [])
+
+    assert room.target == OTHER_TARGET
+    assert pressed.calls == []
+    assert other.calls == [("setpoint", OTHER_TARGET)]
+    assert infos(caplog) == [f"living room: target {OTHER_TARGET} from climate.window"]
+
+
+async def test_setpoint_set_in_fallback_counts_when_readings_return() -> None:
+    """A step that leaves fallback steps against the adopted target."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    await go_fallback(room, trv, now=at(90))
+    press(trv, OTHER_TARGET, minutes=100)
+
+    await room.step(at(105), fresh(20.0, at(105)))
+
+    assert room.target == OTHER_TARGET
+    assert room.last_error == pytest.approx(OTHER_TARGET - 20.0)
+
+
+@pytest.mark.parametrize("in_fallback", [False, True])
+async def test_latest_press_wins(*, in_fallback: bool) -> None:
+    """Of TRVs set by hand since the last step, the one pressed last is adopted."""
+    trvs = [
+        FakeTrv(name="climate.window", valve=0.0),
+        FakeTrv(name="climate.door", valve=0.0),
+        FakeTrv(name="climate.corner", valve=0.0),
+    ]
+    room = make_room(trvs)
+    await go_direct(room, *trvs)
+    if in_fallback:
+        await go_fallback(room, *trvs, now=at(90))
+    press(trvs[0], OTHER_TARGET, minutes=95)
+    press(trvs[1], LATEST_TARGET, minutes=100)
+    press(trvs[2], 24.0, minutes=98)
+
+    await room.step(at(105), fresh(20.0, at(105)))
+
+    assert room.target == LATEST_TARGET
+    assert [trv.pressed for trv in trvs] == [None, None, None]
+
+
+async def test_room_without_target_adopts_nothing() -> None:
+    """Without a target the room does nothing, a TRV's setpoint included."""
+    trv = FakeTrv()
+    trv.pressed = Press(OTHER_TARGET, START)
+    room = make_room([trv])
+
+    await room.step(START, fresh(20.0, START))
+    await room.step(START + STALE_TIMEOUT + CONTROL_STEP, [])
+
+    assert room.target is None
+    assert trv.calls == []
+
+
+async def test_stopped_room_adopts_nothing() -> None:
+    """After a stop, setpoints set on the TRVs stay theirs."""
+    trv = FakeTrv(valve=0.0)
+    room = make_room([trv])
+    await go_direct(room, trv)
+    await go_fallback(room, trv, now=at(90))
+    await room.stop()
+    press(trv, OTHER_TARGET, minutes=100)
+
+    await room.step(at(105), [])
+
+    assert room.target == TARGET
+    assert trv.calls == []
+
+
 async def test_stale_sensor_is_ignored_when_another_is_fresh() -> None:
     """Of two sensors, only the one reported within the timeout counts."""
     room = make_room([FakeTrv(valve=0.0)])
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
     now = START + 2 * STALE_TIMEOUT
 
     await room.step(now, [Reading(20.0, now), Reading(10.0, START)])
@@ -479,7 +718,7 @@ async def test_stale_sensor_is_ignored_when_another_is_fresh() -> None:
 async def test_fresh_sensors_are_averaged() -> None:
     """The room reading is the mean of the fresh readings."""
     room = make_room([FakeTrv(valve=0.0)])
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
 
     await room.step(START, [Reading(20.0, START), Reading(21.0, START)])
 
@@ -490,7 +729,7 @@ async def test_fresh_sensors_are_averaged() -> None:
 async def test_non_finite_reading_is_ignored(bad: float) -> None:
     """A nan or inf reading counts as no reading."""
     room = make_room([FakeTrv(valve=0.0)])
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
 
     await room.step(START, [Reading(bad, START), Reading(20.0, START)])
     assert room.last_error == pytest.approx(1.0)
@@ -501,7 +740,7 @@ async def test_only_non_finite_readings_count_as_none(bad: float) -> None:
     """With only non-finite readings the room stays waiting."""
     trv = FakeTrv()
     room = make_room([trv])
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
 
     await room.step(START, [Reading(bad, START)])
 
@@ -513,7 +752,7 @@ async def test_startup_without_readings_waits_until_stale_timeout() -> None:
     """TRVs are untouched until the stale timeout has passed since start."""
     trv = FakeTrv(mode=TrvMode.DIRECT, setpoint=19.0)
     room = make_room([trv])
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
 
     for minutes in (0, 15, 30, 45):
         await room.step(at(minutes), [])
@@ -580,7 +819,7 @@ async def test_hand_back_from_waiting_hands_back() -> None:
     """A room still waiting for readings hands back TRVs left in direct mode."""
     trv = FakeTrv(mode=TrvMode.DIRECT, setpoint=19.0)
     room = make_room([trv])
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
     await room.step(START, [])
     assert room.control_mode is ControlMode.WAITING
 
@@ -594,7 +833,7 @@ async def test_hand_back_waits_for_a_suspended_step() -> None:
     """A step suspended in a TRV write finishes before the hand back starts."""
     trv = FakeTrv(valve=0.0)
     room = make_room([trv])
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
     gate = close_gates(trv)
     step = asyncio.create_task(room.step(START, fresh(20.0, START)))
     await trv.suspended.wait()
@@ -621,7 +860,7 @@ async def test_hand_back_forces_heat_on_a_cancelled_enter_direct() -> None:
     entering = FakeTrv(valve=0.0, setpoint=TARGET)
     untouched = FakeTrv(valve=0.0, setpoint=TARGET)
     room = make_room([directed, entering, untouched])
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
     close_gates(entering)
     step = asyncio.create_task(room.step(START, fresh(20.0, START)))
     await entering.suspended.wait()
@@ -649,7 +888,7 @@ async def test_stopped_room_writes_nothing() -> None:
 
     await room.step(at(15), fresh(20.0, at(15)))
     await room.step(at(120), [])
-    await room.set_target(OTHER_TARGET)
+    await room.set_target(OTHER_TARGET, START)
     await room.hand_back()
 
     assert trv.calls == []
@@ -669,7 +908,7 @@ async def test_stop_ends_the_room_without_writing() -> None:
 
     await room.stop()
     await room.step(at(15), fresh(20.0, at(15)))
-    await room.set_target(OTHER_TARGET)
+    await room.set_target(OTHER_TARGET, START)
     await room.hand_back()
 
     assert trv.calls == []
@@ -681,14 +920,14 @@ async def test_stop_waits_for_a_fallback_target_write() -> None:
     """A target write in progress finishes first; one queued after writes nothing."""
     trv = FakeTrv(mode=TrvMode.SELF_REGULATING, setpoint=TARGET)
     room = make_room([trv])
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
     await go_fallback(room, trv, now=at(2 * STALE_TIMEOUT.total_seconds() / 60))
     gate = close_gates(trv)
-    first = asyncio.create_task(room.set_target(OTHER_TARGET))
+    first = asyncio.create_task(room.set_target(OTHER_TARGET, START))
     await trv.suspended.wait()
 
     stop = asyncio.create_task(room.stop())
-    later = asyncio.create_task(room.set_target(LATEST_TARGET))
+    later = asyncio.create_task(room.set_target(LATEST_TARGET, START))
     await settle()
     assert not stop.done()
     gate.set()
@@ -708,7 +947,7 @@ async def test_target_set_during_hand_back_is_recorded_not_written() -> None:
     hand_back = asyncio.create_task(room.hand_back())
     await trv.suspended.wait()
 
-    await room.set_target(OTHER_TARGET)
+    await room.set_target(OTHER_TARGET, START)
     gate.set()
     await hand_back
 
@@ -725,7 +964,7 @@ async def test_target_set_during_fallback_step_is_written_after_it() -> None:
     step = asyncio.create_task(room.step(at(90), []))
     await trv.suspended.wait()
 
-    set_target = asyncio.create_task(room.set_target(22.5))
+    set_target = asyncio.create_task(room.set_target(22.5, START))
     await settle()
     assert trv.calls == [("heat",)]
     gate.set()
@@ -739,12 +978,12 @@ async def test_target_set_during_step_is_recorded_at_once() -> None:
     """A step suspended in a TRV write does not delay the new target."""
     trv = FakeTrv(valve=0.0)
     room = make_room([trv])
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
     gate = close_gates(trv)
     step = asyncio.create_task(room.step(START, fresh(20.0, START)))
     await trv.suspended.wait()
 
-    set_target = asyncio.create_task(room.set_target(OTHER_TARGET))
+    set_target = asyncio.create_task(room.set_target(OTHER_TARGET, START))
     await settle()
 
     assert room.target == OTHER_TARGET
@@ -762,8 +1001,8 @@ async def test_fallback_write_after_a_step_uses_the_latest_target() -> None:
     step = asyncio.create_task(room.step(at(90), []))
     await trv.suspended.wait()
 
-    first = asyncio.create_task(room.set_target(OTHER_TARGET))
-    second = asyncio.create_task(room.set_target(LATEST_TARGET))
+    first = asyncio.create_task(room.set_target(OTHER_TARGET, START))
+    second = asyncio.create_task(room.set_target(LATEST_TARGET, START))
     await settle()
     gate.set()
     await asyncio.gather(step, first, second)
@@ -854,7 +1093,7 @@ async def test_offset_written_when_it_moves_at_least_threshold(
     trv = FakeTrv(mode=TrvMode.DIRECT, valve=30.0, own_temperature=20.0)
     trv.offset = offset
     room = make_room([trv])
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
 
     await room.step(START, fresh(20.5, START))
 
@@ -866,7 +1105,7 @@ async def test_offset_change_of_nominal_threshold_is_written() -> None:
     """20.7 - 20.0 - 0.4 is 0.2999... in floats; in tenths it is the threshold."""
     trv = FakeTrv(mode=TrvMode.DIRECT, valve=30.0, own_temperature=20.0, offset=0.4)
     room = make_room([trv])
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
 
     await room.step(START, fresh(20.7, START))
 
@@ -879,7 +1118,7 @@ async def test_offset_beyond_device_limit_is_clamped_and_written_once() -> None:
     """A gap past the TRV's limit writes the limit, not the gap after every report."""
     trv = FakeTrv(mode=TrvMode.DIRECT, valve=30.0, own_temperature=26.0)
     room = make_room([trv])
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
 
     await room.step(START, fresh(20.5, START))
     assert [c for c in trv.calls if c[0] == "offset"] == [("offset", -5.0)]
@@ -894,7 +1133,7 @@ async def test_offset_not_written_without_own_temperature() -> None:
     """Without the TRV's own reading there is no offset to compute."""
     trv = FakeTrv(mode=TrvMode.DIRECT, valve=30.0, own_temperature=None)
     room = make_room([trv])
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
 
     await room.step(START, fresh(20.0, START))
 
@@ -906,7 +1145,7 @@ async def test_failed_sends_are_not_counted() -> None:
     failing = FakeTrv(valve=0.0, own_temperature=19.0, sends=False)
     working = FakeTrv(valve=0.0, own_temperature=19.0)
     room = make_room([failing, working], device_writes=5)
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
 
     await room.step(START, fresh(20.0, START))
 
@@ -956,7 +1195,7 @@ async def test_failed_reentry_after_external_change_warns_once(
 async def test_first_direct_step_does_not_integrate() -> None:
     """A new room has had no interval to integrate over, restored or not."""
     room = make_room([FakeTrv(valve=0.0)], integral=RESTORED_INTEGRAL)
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
 
     await room.step(START, fresh(20.0, START))
 
@@ -1028,7 +1267,7 @@ async def test_needs_immediate_step(
 ) -> None:
     """A fresh reading calls for a step only outside direct mode."""
     room = make_room([FakeTrv(valve=0.0)])
-    await room.set_target(TARGET)
+    await room.set_target(TARGET, START)
     now = START + 2 * STALE_TIMEOUT
     if mode_after is ControlMode.DIRECT:
         await room.step(now, fresh(20.0, now))

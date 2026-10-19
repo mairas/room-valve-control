@@ -1,5 +1,6 @@
 """Tests for the room thermostat entity."""
 
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
@@ -21,10 +22,13 @@ from pytest_homeassistant_custom_component.common import (
 
 from custom_components.room_valve_control.climate import TARGET_TEMPERATURE_STEP
 from custom_components.room_valve_control.const import (
+    DEFAULT_CONTROL_STEP,
     DEFAULT_MAX_TARGET,
     DEFAULT_MIN_TARGET,
+    DEFAULT_STALE_TIMEOUT,
     DOMAIN,
 )
+from custom_components.room_valve_control.spirit import DIRECT_MODE_PRESET
 
 from .live_room import (
     ROOM_CLIMATE,
@@ -36,6 +40,7 @@ from .live_room import (
     async_advance,
     async_set_room_target,
     async_setup_room,
+    async_setup_spirits,
 )
 
 if TYPE_CHECKING:
@@ -51,6 +56,15 @@ MODE_SENSOR: Final = "sensor.living_room_control_mode"
 BELOW_TARGET: Final = "20.0"
 LATER_READING: Final = "20.4"
 NEXT_TARGET: Final = 21.3
+PRESSED_SETPOINT: Final = 22.5
+# A press later than the target change, which a frozen clock does not give.
+PRESS_DELAY: Final = timedelta(minutes=1)
+# Off the TRVs' own setpoint, so a fallback step writes it.
+FALLBACK_TARGET: Final = 20.5
+# Off the TRVs' 0.5 °C step, which a fallback step writes as ON_STEP_TARGET.
+OFF_STEP_TARGET: Final = 21.3
+ON_STEP_TARGET: Final = 21.5
+STEPS_IN_STARTUP_GRACE: Final = DEFAULT_STALE_TIMEOUT // DEFAULT_CONTROL_STEP - 1
 
 
 def restore(hass: HomeAssistant, extra: dict[str, Any]) -> None:
@@ -222,3 +236,114 @@ async def test_stored_state_round_trips(
         "controller": {"integral": pytest.approx(12.0)},
         "device_writes": len(calls),
     }
+
+
+async def _async_step_targets(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> tuple[object, object]:
+    """Run a step; return the target the thermostat then shows and stores."""
+    await async_advance(hass, freezer)
+    state = hass.states.get(ROOM_CLIMATE)
+    assert state is not None
+    stored = await async_mock_restore_state_shutdown_restart(hass)
+    extra = stored.last_states[ROOM_CLIMATE].extra_data
+    assert extra is not None
+    return state.attributes[ATTR_TEMPERATURE], extra.as_dict()["target"]
+
+
+@pytest.mark.usefixtures("zwave_js_flow")
+@pytest.mark.parametrize("direct_at_start", [False, True])
+async def test_setpoint_set_on_a_direct_trv_becomes_the_target(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    direct_at_start: bool,  # noqa: FBT001
+) -> None:
+    """
+    A press on a TRV in direct mode is the thermostat's target after the step.
+
+    So too after a restart, when the room finds the TRVs in mode 31 already.
+    """
+    calls: list[TrvCall] = []
+    trvs = await async_setup_spirits(hass, calls)
+    if direct_at_start:
+        for trv in trvs:
+            trv.set_direct()
+    hass.states.async_set(WALL_SENSOR, BELOW_TARGET)
+    await async_setup_room(hass)
+    await async_set_room_target(hass, RESTORED_TARGET)
+    calls.clear()
+
+    freezer.tick(PRESS_DELAY)
+    trvs[0].press(PRESSED_SETPOINT)
+
+    assert await _async_step_targets(hass, freezer) == (
+        PRESSED_SETPOINT,
+        PRESSED_SETPOINT,
+    )
+    assert calls[0] == ("set_preset_mode", TRVS[0].climate, DIRECT_MODE_PRESET)
+    mode = hass.states.get(MODE_SENSOR)
+    assert mode is not None
+    assert mode.state == "direct"
+
+
+@pytest.mark.usefixtures("zwave_js_flow")
+async def test_setpoint_set_on_a_fallback_trv_goes_to_the_others(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """In fallback a press is the target, and the room's other TRV gets it."""
+    calls: list[TrvCall] = []
+    trvs = await async_setup_spirits(hass, calls)
+    hass.states.async_set(WALL_SENSOR, STATE_UNKNOWN)
+    await async_setup_room(hass)
+    await async_set_room_target(hass, FALLBACK_TARGET)
+    for _ in range(STEPS_IN_STARTUP_GRACE + 1):
+        await async_advance(hass, freezer)
+    assert calls == [("set_temperature", ids.climate, FALLBACK_TARGET) for ids in TRVS]
+    calls.clear()
+
+    trvs[0].press(PRESSED_SETPOINT)
+
+    assert await _async_step_targets(hass, freezer) == (
+        PRESSED_SETPOINT,
+        PRESSED_SETPOINT,
+    )
+    assert calls == [("set_temperature", TRVS[1].climate, PRESSED_SETPOINT)]
+
+
+@pytest.mark.usefixtures("zwave_js_flow")
+async def test_target_set_after_a_press_wins(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """A target set on the thermostat after a press is the one the step keeps."""
+    calls: list[TrvCall] = []
+    trvs = await async_setup_spirits(hass, calls)
+    hass.states.async_set(WALL_SENSOR, BELOW_TARGET)
+    await async_setup_room(hass)
+    await async_set_room_target(hass, RESTORED_TARGET)
+
+    freezer.tick(PRESS_DELAY)
+    trvs[0].press(PRESSED_SETPOINT)
+    freezer.tick(PRESS_DELAY)
+    await async_set_room_target(hass, NEXT_TARGET)
+
+    assert await _async_step_targets(hass, freezer) == (NEXT_TARGET, NEXT_TARGET)
+
+
+@pytest.mark.usefixtures("zwave_js_flow")
+async def test_fallback_target_off_the_step_stays_the_target(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """The TRVs get the target on their step; reading that back is no press."""
+    calls: list[TrvCall] = []
+    await async_setup_spirits(hass, calls)
+    hass.states.async_set(WALL_SENSOR, STATE_UNKNOWN)
+    await async_setup_room(hass)
+    await async_set_room_target(hass, OFF_STEP_TARGET)
+    for _ in range(STEPS_IN_STARTUP_GRACE + 1):
+        await async_advance(hass, freezer)
+    assert calls == [("set_temperature", ids.climate, ON_STEP_TARGET) for ids in TRVS]
+
+    assert await _async_step_targets(hass, freezer) == (
+        OFF_STEP_TARGET,
+        OFF_STEP_TARGET,
+    )
