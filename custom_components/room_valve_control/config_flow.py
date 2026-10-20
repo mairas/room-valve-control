@@ -2,7 +2,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Final, override
+from typing import TYPE_CHECKING, Any, Final, Literal, override
 
 import voluptuous as vol
 from homeassistant.components.climate.const import DOMAIN as CLIMATE_DOMAIN
@@ -32,18 +32,27 @@ from homeassistant.helpers.selector import (
 
 from .const import (
     CONF_CONTROL_STEP,
+    CONF_FALLBACK_FLOOR_SETPOINT,
+    CONF_FLOOR_HEATERS,
+    CONF_FLOOR_MAX,
+    CONF_FLOOR_MIN,
     CONF_KP,
     CONF_MAX_TARGET,
     CONF_MIN_CHANGE,
+    CONF_MIN_ON_TIME,
     CONF_MIN_TARGET,
     CONF_SENSORS,
     CONF_STALE_TIMEOUT,
     CONF_TI,
     CONF_TRVS,
     DEFAULT_CONTROL_STEP,
+    DEFAULT_FALLBACK_FLOOR_SETPOINT,
+    DEFAULT_FLOOR_MAX,
+    DEFAULT_FLOOR_MIN,
     DEFAULT_KP,
     DEFAULT_MAX_TARGET,
     DEFAULT_MIN_CHANGE,
+    DEFAULT_MIN_ON_TIME,
     DEFAULT_MIN_TARGET,
     DEFAULT_STALE_TIMEOUT,
     DEFAULT_TI,
@@ -60,7 +69,23 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from datetime import timedelta
 
-DURATION_FIELDS: Final = (CONF_TI, CONF_CONTROL_STEP, CONF_STALE_TIMEOUT)
+DURATION_FIELDS: Final = (
+    CONF_TI,
+    CONF_CONTROL_STEP,
+    CONF_STALE_TIMEOUT,
+    CONF_MIN_ON_TIME,
+)
+# A zero minimum on-time is valid: every on-time is kept.
+POSITIVE_FIELDS: Final = (CONF_KP, CONF_TI, CONF_CONTROL_STEP, CONF_STALE_TIMEOUT)
+# The floor thermostats take whole-degree setpoints.
+FLOOR_SETPOINT_FIELDS: Final = (
+    CONF_FLOOR_MIN,
+    CONF_FALLBACK_FLOOR_SETPOINT,
+    CONF_FLOOR_MAX,
+)
+FLOOR_SETPOINT_STEP: Final = 1
+# Leaves room for both a minimum on-time and a minimum off-time in a period.
+MAX_MIN_ON_TIME_SHARE: Final = 0.5
 SECONDS_PER_MINUTE: Final = 60
 SECONDS_PER_HOUR: Final = 3600
 
@@ -72,6 +97,10 @@ DEFAULT_ROOM: Final[RoomParameters] = {
     CONF_STALE_TIMEOUT: DEFAULT_STALE_TIMEOUT.total_seconds(),
     CONF_MIN_TARGET: DEFAULT_MIN_TARGET,
     CONF_MAX_TARGET: DEFAULT_MAX_TARGET,
+    CONF_FLOOR_MAX: DEFAULT_FLOOR_MAX,
+    CONF_FLOOR_MIN: DEFAULT_FLOOR_MIN,
+    CONF_FALLBACK_FLOOR_SETPOINT: DEFAULT_FALLBACK_FLOOR_SETPOINT,
+    CONF_MIN_ON_TIME: DEFAULT_MIN_ON_TIME.total_seconds(),
 }
 
 # Used by the minimum change field's description and its error, so every form
@@ -82,10 +111,19 @@ LIMIT_PLACEHOLDERS: Final = {
 }
 
 
-def _number(unit: str) -> NumberSelector:
+def _number(unit: str, step: float | Literal["any"] = "any") -> NumberSelector:
     return NumberSelector(
         NumberSelectorConfig(
-            mode=NumberSelectorMode.BOX, step="any", unit_of_measurement=unit
+            mode=NumberSelectorMode.BOX, step=step, unit_of_measurement=unit
+        )
+    )
+
+
+def _climate_entities() -> EntitySelector:
+    return EntitySelector(
+        EntitySelectorConfig(
+            filter=EntityWithDeviceFilterSelectorConfig(domain=CLIMATE_DOMAIN),
+            multiple=True,
         )
     )
 
@@ -94,7 +132,12 @@ def _room_schema(defaults: Mapping[str, Any]) -> vol.Schema:
     def required(key: str) -> vol.Required:
         return vol.Required(key, default=defaults.get(key, vol.UNDEFINED))
 
+    def devices(key: str) -> vol.Optional:
+        # A room has TRVs or heaters, so the other field is left empty.
+        return vol.Optional(key, default=defaults.get(key, []))
+
     temperature = _number(UnitOfTemperature.CELSIUS)
+    floor_setpoint = _number(UnitOfTemperature.CELSIUS, FLOOR_SETPOINT_STEP)
     return vol.Schema(
         {
             required(CONF_NAME): TextSelector(),
@@ -107,12 +150,8 @@ def _room_schema(defaults: Mapping[str, Any]) -> vol.Schema:
                     multiple=True,
                 )
             ),
-            required(CONF_TRVS): EntitySelector(
-                EntitySelectorConfig(
-                    filter=EntityWithDeviceFilterSelectorConfig(domain=CLIMATE_DOMAIN),
-                    multiple=True,
-                )
-            ),
+            devices(CONF_TRVS): _climate_entities(),
+            devices(CONF_FLOOR_HEATERS): _climate_entities(),
             required(CONF_KP): _number(f"{PERCENTAGE}/{UnitOfTemperature.CELSIUS}"),
             required(CONF_TI): DurationSelector(),
             required(CONF_CONTROL_STEP): DurationSelector(),
@@ -120,6 +159,10 @@ def _room_schema(defaults: Mapping[str, Any]) -> vol.Schema:
             required(CONF_STALE_TIMEOUT): DurationSelector(),
             required(CONF_MIN_TARGET): temperature,
             required(CONF_MAX_TARGET): temperature,
+            required(CONF_FLOOR_MAX): floor_setpoint,
+            required(CONF_FLOOR_MIN): floor_setpoint,
+            required(CONF_FALLBACK_FLOOR_SETPOINT): floor_setpoint,
+            required(CONF_MIN_ON_TIME): DurationSelector(),
         }
     )
 
@@ -146,6 +189,7 @@ class _RoomForm:
     name: str
     sensors: list[str]
     trvs: list[str]
+    heaters: list[str]
     parameters: RoomParameters
 
     def config(self, registry: er.EntityRegistry) -> RoomConfig:
@@ -154,6 +198,7 @@ class _RoomForm:
             **self.parameters,
             CONF_SENSORS: _registry_ids(registry, self.sensors),
             CONF_TRVS: _registry_ids(registry, self.trvs),
+            CONF_FLOOR_HEATERS: _registry_ids(registry, self.heaters),
         }
 
 
@@ -171,6 +216,7 @@ def _parse(user_input: Mapping[str, Any]) -> _RoomForm:
         name=user_input[CONF_NAME],
         sensors=user_input[CONF_SENSORS],
         trvs=user_input[CONF_TRVS],
+        heaters=user_input[CONF_FLOOR_HEATERS],
         parameters={
             CONF_KP: user_input[CONF_KP],
             CONF_TI: seconds(CONF_TI),
@@ -179,6 +225,10 @@ def _parse(user_input: Mapping[str, Any]) -> _RoomForm:
             CONF_STALE_TIMEOUT: seconds(CONF_STALE_TIMEOUT),
             CONF_MIN_TARGET: user_input[CONF_MIN_TARGET],
             CONF_MAX_TARGET: user_input[CONF_MAX_TARGET],
+            CONF_FLOOR_MAX: user_input[CONF_FLOOR_MAX],
+            CONF_FLOOR_MIN: user_input[CONF_FLOOR_MIN],
+            CONF_FALLBACK_FLOOR_SETPOINT: user_input[CONF_FALLBACK_FLOOR_SETPOINT],
+            CONF_MIN_ON_TIME: seconds(CONF_MIN_ON_TIME),
         },
     )
 
@@ -192,13 +242,16 @@ def _parameter_errors(parameters: RoomParameters) -> dict[str, str]:
         CONF_STALE_TIMEOUT: parameters[CONF_STALE_TIMEOUT],
         CONF_MIN_TARGET: parameters[CONF_MIN_TARGET],
         CONF_MAX_TARGET: parameters[CONF_MAX_TARGET],
+        CONF_FLOOR_MAX: parameters[CONF_FLOOR_MAX],
+        CONF_FLOOR_MIN: parameters[CONF_FLOOR_MIN],
+        CONF_FALLBACK_FLOOR_SETPOINT: parameters[CONF_FALLBACK_FLOOR_SETPOINT],
     }
     # Every comparison with NaN is false, so it would pass the checks below.
     if errors := {
         key: "not_finite" for key, value in numbers.items() if not math.isfinite(value)
     }:
         return errors
-    for key in (CONF_KP, *DURATION_FIELDS):
+    for key in POSITIVE_FIELDS:
         if numbers[key] <= 0:
             errors[key] = "not_positive"
     # At or below the endpoint tolerance a valve near 0 or 99 would never be
@@ -207,6 +260,23 @@ def _parameter_errors(parameters: RoomParameters) -> dict[str, str]:
         errors[CONF_MIN_CHANGE] = "min_change_out_of_range"
     if parameters[CONF_MIN_TARGET] >= parameters[CONF_MAX_TARGET]:
         errors[CONF_MAX_TARGET] = "target_range_empty"
+    return errors
+
+
+def _floor_errors(parameters: RoomParameters) -> dict[str, str]:
+    """Return the errors of the parameters only a floor room uses."""
+    errors = {
+        key: "not_whole_degrees"
+        for key in FLOOR_SETPOINT_FIELDS
+        if not float(parameters[key]).is_integer()
+    }
+    if parameters[CONF_FLOOR_MIN] >= parameters[CONF_FALLBACK_FLOOR_SETPOINT]:
+        errors.setdefault(CONF_FALLBACK_FLOOR_SETPOINT, "floor_setpoints_out_of_order")
+    if parameters[CONF_FALLBACK_FLOOR_SETPOINT] >= parameters[CONF_FLOOR_MAX]:
+        errors.setdefault(CONF_FLOOR_MAX, "floor_setpoints_out_of_order")
+    max_min_on_time = parameters[CONF_CONTROL_STEP] * MAX_MIN_ON_TIME_SHARE
+    if parameters[CONF_MIN_ON_TIME] > max_min_on_time:
+        errors[CONF_MIN_ON_TIME] = "min_on_time_too_long"
     return errors
 
 
@@ -223,23 +293,25 @@ def _sensor_error(
     return None
 
 
-def _trv_error(
-    hass: HomeAssistant,
-    entry: ConfigEntry,
-    trvs: list[str],
-    own_subentry_id: str | None,
-) -> tuple[str, dict[str, str]] | None:
-    """Return the first selected TRV's error and its placeholders."""
-    if not trvs:
-        return "no_trv", {}
-    registry = er.async_get(hass)
-    other_rooms = {
+def _other_rooms_devices(
+    entry: ConfigEntry, own_subentry_id: str | None
+) -> dict[str, str]:
+    """Return the other rooms' TRVs and heaters by registry id, to room titles."""
+    return {
         registry_id: subentry.title
         for subentry in entry.subentries.values()
         if subentry.subentry_type == SUBENTRY_TYPE_ROOM
         and subentry.subentry_id != own_subentry_id
-        for registry_id in subentry.data[CONF_TRVS]
+        for key in (CONF_TRVS, CONF_FLOOR_HEATERS)
+        for registry_id in subentry.data.get(key, [])
     }
+
+
+def _trv_error(
+    hass: HomeAssistant, trvs: list[str], other_rooms: Mapping[str, str]
+) -> tuple[str, dict[str, str]] | None:
+    """Return the first selected TRV's error and its placeholders."""
+    registry = er.async_get(hass)
     for trv in trvs:
         registry_entry = registry.async_get(trv)
         if registry_entry is not None and registry_entry.id in other_rooms:
@@ -259,6 +331,47 @@ def _trv_error(
     return None
 
 
+def _heater_error(
+    registry: er.EntityRegistry, heaters: list[str], other_rooms: Mapping[str, str]
+) -> tuple[str, dict[str, str]] | None:
+    """Return the first selected floor heater's error and its placeholders."""
+    for heater in heaters:
+        registry_entry = registry.async_get(heater)
+        # Without a registry entry a renamed heater could not be found again.
+        if registry_entry is None:
+            return "heater_not_registered", {"heater": heater}
+        if registry_entry.id in other_rooms:
+            return "heater_in_use", {
+                "heater": heater,
+                "room": other_rooms[registry_entry.id],
+            }
+        if registry_entry.disabled:
+            return "heater_entity_disabled", {"heater": heater}
+        # A room's thermostat would take the floor setpoints as its room target.
+        if registry_entry.platform == DOMAIN:
+            return "heater_is_room", {"heater": heater}
+    return None
+
+
+def _device_error(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    room: _RoomForm,
+    own_subentry_id: str | None,
+) -> tuple[str, str, dict[str, str]] | None:
+    """Return the field, error and placeholders of the room's first device error."""
+    if not room.trvs and not room.heaters:
+        return CONF_TRVS, "no_trv_or_heater", {}
+    if room.trvs and room.heaters:
+        return CONF_FLOOR_HEATERS, "trvs_and_heaters", {}
+    other_rooms = _other_rooms_devices(entry, own_subentry_id)
+    if trv_error := _trv_error(hass, room.trvs, other_rooms):
+        return CONF_TRVS, *trv_error
+    if heater_error := _heater_error(er.async_get(hass), room.heaters, other_rooms):
+        return CONF_FLOOR_HEATERS, *heater_error
+    return None
+
+
 def _validate(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -267,13 +380,16 @@ def _validate(
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Return the form's errors by field and the placeholders they use."""
     errors = _parameter_errors(room.parameters)
+    if room.heaters:
+        # A parameter's own error, such as not finite, wins over a floor one.
+        errors = _floor_errors(room.parameters) | errors
     placeholders: dict[str, str] = {}
     if sensor_error := _sensor_error(er.async_get(hass), room.sensors):
         errors[CONF_SENSORS], sensor_placeholders = sensor_error
         placeholders |= sensor_placeholders
-    if trv_error := _trv_error(hass, entry, room.trvs, own_subentry_id):
-        errors[CONF_TRVS], trv_placeholders = trv_error
-        placeholders |= trv_placeholders
+    if device_error := _device_error(hass, entry, room, own_subentry_id):
+        field, errors[field], device_placeholders = device_error
+        placeholders |= device_placeholders
     return errors, placeholders
 
 
@@ -345,10 +461,15 @@ class RoomSubentryFlow(ConfigSubentryFlow):
             _form_values(
                 subentry.title,
                 {
+                    # A room stored before floor heaters lacks their keys.
+                    **DEFAULT_ROOM,
                     **subentry.data,
                     # A removed entity is left out of the form.
                     CONF_SENSORS: entity_ids(self.hass, subentry.data[CONF_SENSORS])[0],
                     CONF_TRVS: entity_ids(self.hass, subentry.data[CONF_TRVS])[0],
+                    CONF_FLOOR_HEATERS: entity_ids(
+                        self.hass, subentry.data.get(CONF_FLOOR_HEATERS, [])
+                    )[0],
                 },
             ),
             user_input,

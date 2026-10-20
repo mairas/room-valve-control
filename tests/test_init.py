@@ -36,7 +36,7 @@ from custom_components.room_valve_control.const import (
     DEFAULT_CONTROL_STEP,
     DEFAULT_STALE_TIMEOUT,
     DOMAIN,
-    ISSUE_ROOM_WITHOUT_TRVS,
+    ISSUE_ROOM_WITHOUT_DEVICES,
     ISSUE_UNUSABLE_TRV,
     SUBENTRY_TYPE_ROOM,
 )
@@ -44,6 +44,7 @@ from custom_components.room_valve_control.room import ControlMode
 from custom_components.room_valve_control.spirit import DIRECT_MODE_PRESET
 
 from .live_room import (
+    FLOOR_KEYS,
     ROOM_CLIMATE,
     ROOM_ID,
     ROOM_TITLE,
@@ -544,7 +545,7 @@ async def test_room_without_usable_trv_is_not_set_up(hass: HomeAssistant) -> Non
     assert hass.states.get(ROOM_CLIMATE) is not None
     assert hass.states.get(OTHER_ROOM_CLIMATE) is None
     assert ir.async_get(hass).async_get_issue(
-        DOMAIN, f"{ISSUE_ROOM_WITHOUT_TRVS}_{OTHER_ROOM_ID}"
+        DOMAIN, f"{ISSUE_ROOM_WITHOUT_DEVICES}_{OTHER_ROOM_ID}"
     )
     assert unusable_trv_issue(hass, registry_ids(hass, [TRVS[1].climate])[0])
     assert [call for call in calls if call[1] == TRVS[1].climate] == []
@@ -1042,6 +1043,27 @@ async def test_reload_does_not_integrate_a_step(
     assert integrator is not None
     assert mode.state == "direct"
     assert float(integrator.state) == pytest.approx(integral)
+
+
+async def test_room_stored_before_floor_heaters_runs(
+    hass: HomeAssistant, calls: list[TrvCall]
+) -> None:
+    """A TRV room without the floor keys sets up and drives its TRVs."""
+    hass.states.async_set(WALL_SENSOR, READING)
+    subentry = room_subentry(
+        ROOM_ID,
+        ROOM_TITLE,
+        sensors=registry_ids(hass, [WALL_SENSOR]),
+        trvs=registry_ids(hass, [ids.climate for ids in TRVS]),
+    )
+    subentry["data"] = {
+        key: value for key, value in subentry["data"].items() if key not in FLOOR_KEYS
+    }
+    await async_setup_rooms(hass, [subentry])
+
+    await async_set_room_target(hass, TARGET)
+
+    assert calls == entering_direct()
 
 
 async def test_renamed_climate_entity_keeps_the_room_running(

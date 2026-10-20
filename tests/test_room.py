@@ -4,11 +4,15 @@ import asyncio
 import contextlib
 import logging
 import math
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Final
 
 import pytest
 
+from custom_components.room_valve_control.const import (
+    DEFAULT_FALLBACK_FLOOR_SETPOINT,
+)
 from custom_components.room_valve_control.controller import PIController, PIGains
 from custom_components.room_valve_control.room import (
     ControlMode,
@@ -19,7 +23,7 @@ from custom_components.room_valve_control.room import (
 from custom_components.room_valve_control.trv import Press, TrvMode
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
 KP: Final = 30.0
 TI: Final = timedelta(hours=2)
@@ -1298,3 +1302,339 @@ async def test_controller_state_is_what_the_controller_restores_from() -> None:
     restored = PIController.from_dict(GAINS, room.controller_state)
 
     assert restored.integral == room.integrator > 0
+
+
+# Floor rooms
+
+PERCENT: Final = 100
+OWN_FALLBACK_SETPOINT: Final = 24.0
+
+
+class FakeFloorHeater:
+    """A floor heater that records its calls and keeps the off edge it owes."""
+
+    def __init__(self, *, available: bool = True, sends: bool = True) -> None:
+        """Create a heater in the given state."""
+        self.available = available
+        self.sends = sends
+        # When the off edge of the running period is due, None without one.
+        self.pending_off: datetime | None = None
+        self.on_edge_written: Callable[[int], None] | None = None
+        # While set, every write waits for the gate after recording its call.
+        self.gate: asyncio.Event | None = None
+        self.suspended = asyncio.Event()
+        self.calls: list[Call] = []
+
+    async def _wait_for_gate(self) -> None:
+        if self.gate is not None:
+            self.suspended.set()
+            await self.gate.wait()
+
+    async def apply_duty(self, output: float, period: timedelta, now: datetime) -> int:
+        """Record the period start and owe an off edge inside the period."""
+        self.pending_off = None
+        self.calls.append(("duty", output, period, now))
+        await self._wait_for_gate()
+        if 0 < output < PERCENT:
+            self.pending_off = now + period * output / PERCENT
+        return int(self.sends and self.available)
+
+    async def hold_setpoint(self, setpoint: float) -> int:
+        """Drop the owed off edge, then record the setpoint."""
+        self.pending_off = None
+        self.calls.append(("hold", setpoint))
+        await self._wait_for_gate()
+        return int(self.sends and self.available)
+
+    def fire_edge(self) -> bool:
+        """Write the owed off edge as the timer would; return whether one was owed."""
+        if self.pending_off is None:
+            return False
+        self.pending_off = None
+        if self.on_edge_written is not None:
+            self.on_edge_written(int(self.sends))
+        return True
+
+
+def make_floor_room(
+    heaters: Sequence[FakeFloorHeater],
+    integral: float = 0.0,
+    settings: RoomSettings = SETTINGS,
+) -> Room:
+    """Create a floor room started at START whose heaters report to it."""
+    room = Room(
+        settings,
+        [],
+        PIController(GAINS, integral),
+        START,
+        name="bathroom",
+        heaters=heaters,
+    )
+    for heater in heaters:
+        heater.on_edge_written = room.count_edge_writes
+    return room
+
+
+def clear_heaters(*heaters: FakeFloorHeater) -> None:
+    """Forget the calls recorded so far."""
+    for heater in heaters:
+        heater.calls.clear()
+
+
+HOLD_FALLBACK: Final[Call] = ("hold", DEFAULT_FALLBACK_FLOOR_SETPOINT)
+
+
+async def test_direct_step_applies_the_output_to_every_available_heater() -> None:
+    """Each available heater starts a period of the PI output over the step."""
+    heaters = [
+        FakeFloorHeater(),
+        FakeFloorHeater(available=False),
+        FakeFloorHeater(),
+    ]
+    room = make_floor_room(heaters)
+    await room.set_target(TARGET, START)
+
+    await room.step(START, fresh(20.0, START))
+
+    assert room.control_mode is ControlMode.DIRECT
+    assert room.last_output == round(KP * 1.0)
+    assert heaters[0].calls == [("duty", 30, CONTROL_STEP, START)]
+    assert heaters[1].calls == []
+    assert heaters[2].calls == [("duty", 30, CONTROL_STEP, START)]
+    assert room.device_writes == len(heaters) - 1
+
+
+async def test_stale_reading_cancels_the_off_edge_and_holds_fallback() -> None:
+    """Fallback cancels the period's pending off before writing the fallback."""
+    heater = FakeFloorHeater()
+    room = make_floor_room([heater])
+    await room.set_target(TARGET, START)
+    await room.step(START, fresh(20.0, START))
+    assert heater.pending_off is not None
+    clear_heaters(heater)
+
+    await room.step(at(15), [])
+
+    assert room.control_mode is ControlMode.FALLBACK
+    assert heater.calls == [HOLD_FALLBACK]
+    assert not heater.fire_edge()
+
+
+async def test_fallback_holds_the_fallback_setpoint_on_every_step() -> None:
+    """The fallback is rewritten each step, for a heater that missed it."""
+    heater = FakeFloorHeater()
+    room = make_floor_room([heater])
+    await room.set_target(TARGET, START)
+
+    await room.step(at(60), [])
+    await room.step(at(75), [])
+
+    assert heater.calls == [HOLD_FALLBACK, HOLD_FALLBACK]
+    assert room.device_writes == len(heater.calls)
+
+
+async def test_fallback_holds_the_rooms_own_fallback_setpoint() -> None:
+    """A room's configured fallback replaces the default."""
+    heater = FakeFloorHeater()
+    settings = replace(SETTINGS, fallback_floor_setpoint=OWN_FALLBACK_SETPOINT)
+    room = make_floor_room([heater], settings=settings)
+    await room.set_target(TARGET, START)
+
+    await room.step(at(60), [])
+
+    assert heater.calls == [("hold", OWN_FALLBACK_SETPOINT)]
+
+
+async def test_fallback_cancels_the_edge_of_an_unavailable_heater() -> None:
+    """A heater gone unavailable mid-period gets no late off edge either."""
+    heater = FakeFloorHeater()
+    room = make_floor_room([heater])
+    await room.set_target(TARGET, START)
+    await room.step(START, fresh(20.0, START))
+    heater.available = False
+    writes = room.device_writes
+
+    await room.step(at(15), [])
+
+    assert not heater.fire_edge()
+    assert room.device_writes == writes
+
+
+async def test_fresh_reading_in_fallback_starts_a_period_at_once() -> None:
+    """The immediate step starts a period off the grid; the next one another."""
+    heater = FakeFloorHeater()
+    room = make_floor_room([heater])
+    await room.set_target(TARGET, START)
+    await room.step(at(60), [])
+    clear_heaters(heater)
+    assert room.needs_immediate_step(at(65), fresh(20.0, at(65)))
+
+    await room.step(at(65), fresh(20.0, at(65)))
+    first_off = heater.pending_off
+    await room.step(at(75), fresh(20.0, at(75)))
+
+    assert [call[3] for call in heater.calls] == [at(65), at(75)]
+    assert first_off is not None
+    assert first_off > at(65)
+    assert heater.pending_off is not None
+    assert heater.pending_off > at(75)
+
+
+async def test_target_change_in_fallback_writes_nothing_to_heaters() -> None:
+    """A floor room's fallback ignores the target; direct uses it next step."""
+    heater = FakeFloorHeater()
+    room = make_floor_room([heater])
+    await room.set_target(TARGET, START)
+    await room.step(at(60), [])
+    clear_heaters(heater)
+
+    await room.set_target(OTHER_TARGET, at(61))
+    assert heater.calls == []
+    await room.step(at(65), fresh(20.0, at(65)))
+
+    assert room.last_error == OTHER_TARGET - 20.0
+    assert heater.calls == [("duty", round(KP * 2.5), CONTROL_STEP, at(65))]
+
+
+@pytest.mark.parametrize("stopping", ["hand_back", "stop"])
+async def test_stopping_cancels_the_edge_and_holds_fallback(stopping: str) -> None:
+    """Hand back and stop leave no timed on running past the room."""
+    heater = FakeFloorHeater()
+    room = make_floor_room([heater])
+    await room.set_target(TARGET, START)
+    await room.step(START, fresh(20.0, START))
+    clear_heaters(heater)
+    writes = room.device_writes
+
+    await getattr(room, stopping)()
+
+    assert room.control_mode is ControlMode.STOPPED
+    assert heater.calls == [HOLD_FALLBACK]
+    assert room.device_writes == writes + 1
+    assert not heater.fire_edge()
+
+
+@pytest.mark.parametrize("stopping", ["hand_back", "stop"])
+async def test_stopping_without_target_holds_fallback(stopping: str) -> None:
+    """The heater may be on from before the room; stopping holds the fallback."""
+    heater = FakeFloorHeater()
+    room = make_floor_room([heater])
+
+    await getattr(room, stopping)()
+
+    assert heater.calls == [HOLD_FALLBACK]
+
+
+async def test_stopped_floor_room_writes_nothing_more() -> None:
+    """After hand back, stopping again, steps and holds reach no heater."""
+    heater = FakeFloorHeater()
+    room = make_floor_room([heater])
+    await room.set_target(TARGET, START)
+    await room.hand_back()
+    clear_heaters(heater)
+
+    await room.stop()
+    await room.hand_back()
+    await room.step(at(15), fresh(20.0, at(15)))
+    await room.step(at(120), [])
+    await room.hold_fallback()
+
+    assert heater.calls == []
+
+
+async def test_stop_waits_for_a_period_start_in_progress() -> None:
+    """A period start in flight finishes first, so stop cancels its off edge."""
+    heater = FakeFloorHeater()
+    room = make_floor_room([heater])
+    await room.set_target(TARGET, START)
+    gate = asyncio.Event()
+    heater.gate = gate
+    step = asyncio.create_task(room.step(START, fresh(20.0, START)))
+    await heater.suspended.wait()
+
+    stop = asyncio.create_task(room.stop())
+    await settle()
+    assert heater.calls == [("duty", 30, CONTROL_STEP, START)]
+    gate.set()
+    await asyncio.gather(step, stop)
+
+    assert heater.calls == [("duty", 30, CONTROL_STEP, START), HOLD_FALLBACK]
+    assert not heater.fire_edge()
+
+
+async def test_all_heaters_unavailable_freezes_integrator() -> None:
+    """With no heater reachable the integrator does not move and nothing is sent."""
+    heaters = [FakeFloorHeater(available=False), FakeFloorHeater(available=False)]
+    room = make_floor_room(heaters, integral=RESTORED_INTEGRAL)
+    await room.set_target(TARGET, START)
+
+    for step in range(4):
+        now = at(step * 15)
+        await room.step(now, fresh(20.0, now))
+
+    assert room.integrator == RESTORED_INTEGRAL
+    assert room.control_mode is ControlMode.DIRECT
+    assert all(heater.calls == [] for heater in heaters)
+    assert room.device_writes == 0
+
+
+async def test_off_edge_is_counted_as_device_writes() -> None:
+    """A timed off edge written outside a step counts like a step's write."""
+    heater = FakeFloorHeater()
+    room = make_floor_room([heater])
+    await room.set_target(TARGET, START)
+    await room.step(START, fresh(20.0, START))
+    writes = room.device_writes
+
+    assert heater.fire_edge()
+
+    assert room.device_writes == writes + 1
+
+
+async def test_hold_fallback_writes_every_heater_at_startup() -> None:
+    """A starting room holds the fallback before it has a reading or a target."""
+    heaters = [FakeFloorHeater(), FakeFloorHeater(available=False)]
+    room = make_floor_room(heaters)
+
+    await room.hold_fallback()
+
+    assert heaters[0].calls == [HOLD_FALLBACK]
+    assert room.device_writes == 1
+    assert room.control_mode is ControlMode.WAITING
+
+
+async def test_hold_fallback_in_a_trv_room_writes_nothing() -> None:
+    """TRV rooms have no fallback floor setpoint."""
+    trv = FakeTrv(mode=TrvMode.DIRECT)
+    room = make_room([trv])
+
+    await room.hold_fallback()
+
+    assert trv.calls == []
+    assert room.device_writes == 0
+
+
+async def test_failed_heater_writes_are_not_counted() -> None:
+    """Writes a heater did not send add nothing."""
+    heater = FakeFloorHeater(sends=False)
+    room = make_floor_room([heater])
+    await room.set_target(TARGET, START)
+
+    await room.step(START, fresh(20.0, START))
+    heater.fire_edge()
+    await room.step(at(15), [])
+
+    assert room.device_writes == 0
+
+
+async def test_room_with_trvs_and_heaters_is_rejected() -> None:
+    """A room is driven by TRVs or by floor heaters, never both."""
+    with pytest.raises(ValueError, match="both"):
+        Room(
+            SETTINGS,
+            [FakeTrv()],
+            PIController(GAINS),
+            START,
+            name="bathroom",
+            heaters=[FakeFloorHeater()],
+        )

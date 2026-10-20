@@ -1,4 +1,4 @@
-"""A room's running control: its TRVs, state machine and step scheduling."""
+"""A room's running control: its devices, state machine and step scheduling."""
 
 import asyncio
 import logging
@@ -19,6 +19,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_CONTROL_STEP,
+    CONF_FALLBACK_FLOOR_SETPOINT,
     CONF_KP,
     CONF_MAX_TARGET,
     CONF_MIN_CHANGE,
@@ -26,6 +27,7 @@ from .const import (
     CONF_SENSORS,
     CONF_STALE_TIMEOUT,
     CONF_TI,
+    DEFAULT_FALLBACK_FLOOR_SETPOINT,
     DOMAIN,
 )
 from .controller import PIController, PIGains
@@ -40,6 +42,7 @@ if TYPE_CHECKING:
     from homeassistant.core import Event, EventStateChangedData, EventStateReportedData
     from homeassistant.helpers.entity_registry import EventEntityRegistryUpdatedData
 
+    from .floor_heater import ClimateFloorHeater
     from .spirit import SpiritTrv
 
 _LOGGER = logging.getLogger(__name__)
@@ -49,7 +52,11 @@ type RoomValveControlConfigEntry = ConfigEntry[dict[str, RoomRuntime]]
 
 
 class RoomRuntime:
-    """One room's TRVs and control state, stepped on a timer and on readings."""
+    """
+    One room's devices and control state, stepped on a timer and on readings.
+
+    The devices are TRVs or floor heaters, never both.
+    """
 
     def __init__(
         self,
@@ -57,11 +64,13 @@ class RoomRuntime:
         entry: RoomValveControlConfigEntry,
         subentry: ConfigSubentry,
         trvs: Mapping[str, SpiritTrv],
+        heaters: Mapping[str, ClimateFloorHeater],
     ) -> None:
         """
         Hold the room's configuration; the room starts with async_start.
 
-        trvs are keyed by the entity registry ids the subentry stores.
+        trvs and heaters are keyed by the entity registry ids the subentry
+        stores.
         """
         self._hass = hass
         self._entry = entry
@@ -76,8 +85,12 @@ class RoomRuntime:
             control_step=timedelta(seconds=data[CONF_CONTROL_STEP]),
             min_valve_change=data[CONF_MIN_CHANGE],
             stale_timeout=timedelta(seconds=data[CONF_STALE_TIMEOUT]),
+            fallback_floor_setpoint=data.get(
+                CONF_FALLBACK_FLOOR_SETPOINT, DEFAULT_FALLBACK_FLOOR_SETPOINT
+            ),
         )
         self._trvs = trvs
+        self._heaters = heaters
         self.room: Room | None = None
         # While Core starts, wall sensor states are restored or retained ones
         # however old their value; readings count from when it has started.
@@ -106,7 +119,7 @@ class RoomRuntime:
             )
         if not sensors:
             _LOGGER.warning(
-                "%s: no wall sensor left; the TRVs will regulate on their own",
+                "%s: no wall sensor left; the devices will regulate on their own",
                 self.name,
             )
         return sensors
@@ -157,7 +170,12 @@ class RoomRuntime:
         controller_state: Mapping[str, object] | None,
         device_writes: int,
     ) -> None:
-        """Create the room from restored values, start stepping and step once."""
+        """
+        Create the room from restored values, start stepping and step once.
+
+        Floor heaters first hold the fallback setpoint: one may still be on
+        from before, with its off edge lost.
+        """
         controller = self._restore_controller(controller_state)
         started_at = dt_util.utcnow()
         room = Room(
@@ -167,10 +185,12 @@ class RoomRuntime:
             started_at,
             name=self.name,
             device_writes=device_writes,
+            heaters=list(self._heaters.values()),
         )
         if target is not None:
             # A waiting room only stores the target.
             await room.set_target(target, started_at)
+        await room.hold_fallback()
         self.room = room
         for trv in self._trvs.values():
             trv.start_listening()
@@ -229,9 +249,23 @@ class RoomRuntime:
         """Return the room's TRVs by entity registry id."""
         return self._trvs
 
+    @property
+    def heats_floor(self) -> bool:
+        """Return whether floor heaters, not TRVs, heat the room."""
+        return bool(self._heaters)
+
+    @callback
+    def async_edge_written(self, sent: int) -> None:
+        """Count the writes of a floor heater's timed off edge and show them."""
+        if self.room is not None:
+            self.room.count_edge_writes(sent)
+        self._notify()
+
     async def async_stop(self) -> None:
         """
         Stop the room, leaving the TRVs as they are.
+
+        Floor heaters drop their pending edge and hold the fallback setpoint.
 
         Returns once a target change in progress has finished. The room stops
         in the queue for its lock, so a target change arriving later only
@@ -244,7 +278,7 @@ class RoomRuntime:
         self._notify()
 
     async def async_hand_back(self) -> None:
-        """Stop stepping and put the room's TRVs into self-regulation, once."""
+        """Stop stepping and hand the room's devices back to their own control."""
         await _async_wait(self._stop_stepping())
         if self.room is not None:
             await self.room.hand_back()

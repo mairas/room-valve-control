@@ -1,20 +1,31 @@
-"""Per-room PI control of radiator valves from a wall temperature sensor."""
+"""Per-room PI control of radiator valves or floor heating from a wall sensor."""
 
 import asyncio
 import logging
+from datetime import timedelta
 from typing import TYPE_CHECKING, Final
 
 from homeassistant.const import Platform
+from homeassistant.core import callback
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.util.hass_dict import HassKey
 
 from .const import (
+    CONF_FLOOR_HEATERS,
+    CONF_FLOOR_MAX,
+    CONF_FLOOR_MIN,
+    CONF_MIN_ON_TIME,
     CONF_TRVS,
+    DEFAULT_FLOOR_MAX,
+    DEFAULT_FLOOR_MIN,
+    DEFAULT_MIN_ON_TIME,
     DOMAIN,
-    ISSUE_ROOM_WITHOUT_TRVS,
+    ISSUE_ROOM_WITHOUT_DEVICES,
+    ISSUE_UNUSABLE_FLOOR_HEATER,
     ISSUE_UNUSABLE_TRV,
     SUBENTRY_TYPE_ROOM,
 )
+from .floor_heater import ClimateFloorHeater, FloorHeaterEntityError
 from .registry import entity_ids
 from .runtime import RoomRuntime, RoomValveControlConfigEntry
 from .spirit import SpiritEntityError, SpiritTrv
@@ -40,10 +51,10 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: RoomValveControlConfigEntry
 ) -> bool:
     """
-    Set up a room for every room subentry with a usable TRV.
+    Set up a room for every room subentry with a usable TRV or floor heater.
 
-    A TRV that is not usable is skipped, and left as it is, with a repair issue;
-    the rest of its room, and the other rooms, are set up.
+    A device that is not usable is skipped, and left as it is, with a repair
+    issue; the rest of its room, and the other rooms, are set up.
     """
     previous = hass.data.setdefault(UNLOADED_TRVS, {}).pop(entry.entry_id, {})
     issues: set[str] = set()
@@ -52,12 +63,18 @@ async def async_setup_entry(
         if subentry.subentry_type != SUBENTRY_TYPE_ROOM:
             continue
         trvs = _usable_trvs(hass, subentry, previous, issues)
-        if trvs:
-            rooms[subentry.subentry_id] = RoomRuntime(hass, entry, subentry, trvs)
+        heaters = _usable_heaters(hass, entry, subentry, issues)
+        if trvs or heaters:
+            rooms[subentry.subentry_id] = RoomRuntime(
+                hass, entry, subentry, trvs, heaters
+            )
             continue
-        _LOGGER.warning("%s: no usable TRV; the room is not set up", subentry.title)
-        issue_id = f"{ISSUE_ROOM_WITHOUT_TRVS}_{subentry.subentry_id}"
-        _create_issue(hass, issue_id, ISSUE_ROOM_WITHOUT_TRVS, room=subentry.title)
+        _LOGGER.warning(
+            "%s: no usable TRV or floor heater; the room is not set up",
+            subentry.title,
+        )
+        issue_id = f"{ISSUE_ROOM_WITHOUT_DEVICES}_{subentry.subentry_id}"
+        _create_issue(hass, issue_id, ISSUE_ROOM_WITHOUT_DEVICES, room=subentry.title)
         issues.add(issue_id)
     _delete_issues_except(hass, issues)
     entry.runtime_data = rooms
@@ -85,31 +102,103 @@ def _usable_trvs(
     for registry_id in subentry.data[CONF_TRVS]:
         resolved, _ = entity_ids(hass, [registry_id])
         if not resolved:
-            reason = "its entity registry entry no longer exists"
-            issues.add(_skip_trv(hass, subentry, registry_id, registry_id, reason))
+            issues.add(_skip(hass, subentry, ISSUE_UNUSABLE_TRV, registry_id))
             continue
         try:
             # Built even for a reused adapter: building checks the entities.
             fresh = SpiritTrv(hass, resolved[0])
         except SpiritEntityError as err:
-            issues.add(_skip_trv(hass, subentry, registry_id, resolved[0], str(err)))
+            issues.add(
+                _skip(
+                    hass,
+                    subentry,
+                    ISSUE_UNUSABLE_TRV,
+                    registry_id,
+                    device=resolved[0],
+                    error=err,
+                )
+            )
             continue
         trvs[registry_id] = previous.get(registry_id, fresh)
     return trvs
 
 
-def _skip_trv(
+def _usable_heaters(
+    hass: HomeAssistant,
+    entry: RoomValveControlConfigEntry,
+    subentry: ConfigSubentry,
+    issues: set[str],
+) -> dict[str, ClimateFloorHeater]:
+    """
+    Return the room's usable floor heaters by registry id, as new adapters.
+
+    Nothing carries over from a previous adapter: stopping it dropped its
+    pending edge and wrote the fallback setpoint.
+    """
+    data = subentry.data
+    subentry_id = subentry.subentry_id
+
+    @callback
+    def edge_written(sent: int) -> None:
+        # The room is set up after its heaters, and stopping it cancels their
+        # edges, so it is there whenever one is written.
+        entry.runtime_data[subentry_id].async_edge_written(sent)
+
+    heaters: dict[str, ClimateFloorHeater] = {}
+    for registry_id in data.get(CONF_FLOOR_HEATERS, []):
+        resolved, _ = entity_ids(hass, [registry_id])
+        if not resolved:
+            issues.add(_skip(hass, subentry, ISSUE_UNUSABLE_FLOOR_HEATER, registry_id))
+            continue
+        try:
+            heaters[registry_id] = ClimateFloorHeater(
+                hass,
+                resolved[0],
+                on_setpoint=data.get(CONF_FLOOR_MAX, DEFAULT_FLOOR_MAX),
+                off_setpoint=data.get(CONF_FLOOR_MIN, DEFAULT_FLOOR_MIN),
+                min_on_time=timedelta(
+                    seconds=data.get(
+                        CONF_MIN_ON_TIME, DEFAULT_MIN_ON_TIME.total_seconds()
+                    )
+                ),
+                on_edge_written=edge_written,
+            )
+        except FloorHeaterEntityError as err:
+            issues.add(
+                _skip(
+                    hass,
+                    subentry,
+                    ISSUE_UNUSABLE_FLOOR_HEATER,
+                    registry_id,
+                    device=resolved[0],
+                    error=err,
+                )
+            )
+    return heaters
+
+
+def _skip(  # noqa: PLR0913
     hass: HomeAssistant,
     subentry: ConfigSubentry,
+    issue_key: str,
     registry_id: str,
-    trv: str,
-    reason: str,
+    *,
+    device: str | None = None,
+    error: Exception | None = None,
 ) -> str:
-    """Log the skipped TRV and raise its repair issue; return the issue id."""
-    _LOGGER.warning("%s: TRV %s skipped: %s", subentry.title, trv, reason)
-    issue_id = f"{ISSUE_UNUSABLE_TRV}_{registry_id}"
+    """
+    Log the skipped device and raise its repair issue; return the issue id.
+
+    Without a device entity id or an error, its registry entry is gone.
+    """
+    reason = (
+        "its entity registry entry no longer exists" if error is None else str(error)
+    )
+    device = registry_id if device is None else device
+    _LOGGER.warning("%s: %s skipped: %s", subentry.title, device, reason)
+    issue_id = f"{issue_key}_{registry_id}"
     _create_issue(
-        hass, issue_id, ISSUE_UNUSABLE_TRV, room=subentry.title, trv=trv, reason=reason
+        hass, issue_id, issue_key, room=subentry.title, device=device, reason=reason
     )
     return issue_id
 
@@ -139,10 +228,11 @@ async def async_unload_entry(
     hass: HomeAssistant, entry: RoomValveControlConfigEntry
 ) -> bool:
     """
-    Stop the rooms, leaving every TRV as it is, then unload the platforms.
+    Stop the rooms, then unload the platforms.
 
-    Whether a reload, a disable or a delete, nothing is written to the TRVs.
-    A disabled entry controls nothing, so its repair issues go.
+    Whether a reload, a disable or a delete, nothing is written to the TRVs,
+    and the floor heaters hold their fallback setpoint. A disabled entry
+    controls nothing, so its repair issues go.
     """
     if entry.disabled_by is not None:
         _delete_issues_except(hass, set())
