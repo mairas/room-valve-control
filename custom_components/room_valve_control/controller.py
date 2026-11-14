@@ -13,6 +13,8 @@ VALVE_MAX: Final = 99.0
 # % points a TRV may read back off an endpoint and still count as there; without
 # it a valve reporting 1 after a write of 0 would be rewritten every step.
 ENDPOINT_TOLERANCE: Final = 2.0
+# Switch Multilevel sets the valve in whole % points.
+VALVE_RESOLUTION: Final = 1.0
 
 _INTEGRAL_KEY: Final = "integral"
 

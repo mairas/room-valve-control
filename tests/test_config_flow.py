@@ -259,6 +259,22 @@ async def test_room_with_defaults_is_stored(hass: HomeAssistant) -> None:
     assert dict(subentry.data) == _room_data(hass, [TRV_1, TRV_2])
 
 
+@pytest.mark.parametrize("min_change", [1, 2])
+async def test_min_change_down_to_one_point_is_stored(
+    hass: HomeAssistant, min_change: float
+) -> None:
+    """A valve threshold of one % point, the Z-Wave resolution, is accepted."""
+    entry = await _add_entry(hass)
+
+    result = await _create_room(
+        hass, entry, _room_input(**{CONF_MIN_CHANGE: min_change})
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    (subentry,) = entry.subentries.values()
+    assert subentry.data[CONF_MIN_CHANGE] == min_change
+
+
 async def test_room_stores_registry_ids(hass: HomeAssistant) -> None:
     """Sensors and TRVs are stored by entity registry id, not entity id."""
     entry = await _add_entry(hass)
@@ -423,7 +439,8 @@ async def test_trv_in_another_room_is_refused(hass: HomeAssistant) -> None:
         ({CONF_TI: ZERO_DURATION}, {CONF_TI: "not_positive"}),
         ({CONF_CONTROL_STEP: ZERO_DURATION}, {CONF_CONTROL_STEP: "not_positive"}),
         ({CONF_STALE_TIMEOUT: ZERO_DURATION}, {CONF_STALE_TIMEOUT: "not_positive"}),
-        ({CONF_MIN_CHANGE: 2}, {CONF_MIN_CHANGE: "min_change_out_of_range"}),
+        ({CONF_MIN_CHANGE: 0}, {CONF_MIN_CHANGE: "min_change_out_of_range"}),
+        ({CONF_MIN_CHANGE: 0.5}, {CONF_MIN_CHANGE: "min_change_out_of_range"}),
         ({CONF_MIN_CHANGE: 100}, {CONF_MIN_CHANGE: "min_change_out_of_range"}),
         (
             {CONF_MIN_TARGET: 21.0, CONF_MAX_TARGET: 21.0},
