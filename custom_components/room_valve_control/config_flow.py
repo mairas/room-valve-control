@@ -61,7 +61,7 @@ from .const import (
     RoomConfig,
     RoomParameters,
 )
-from .controller import ENDPOINT_TOLERANCE, VALVE_MAX
+from .controller import VALVE_MAX, VALVE_RESOLUTION
 from .registry import entity_ids
 from .spirit import SpiritEntityError, SpiritTrv
 
@@ -106,7 +106,7 @@ DEFAULT_ROOM: Final[RoomParameters] = {
 # Used by the minimum change field's description and its error, so every form
 # render needs them.
 LIMIT_PLACEHOLDERS: Final = {
-    "endpoint_tolerance": f"{ENDPOINT_TOLERANCE:g}",
+    "valve_resolution": f"{VALVE_RESOLUTION:g}",
     "valve_max": f"{VALVE_MAX:g}",
 }
 
@@ -254,9 +254,11 @@ def _parameter_errors(parameters: RoomParameters) -> dict[str, str]:
     for key in POSITIVE_FIELDS:
         if numbers[key] <= 0:
             errors[key] = "not_positive"
-    # At or below the endpoint tolerance a valve near 0 or 99 would never be
-    # driven to the endpoint while a mid-range move of the same size would be.
-    if not ENDPOINT_TOLERANCE < parameters[CONF_MIN_CHANGE] <= VALVE_MAX:
+    # At or below the endpoint tolerance a valve reading back within it of 0 or
+    # 99 is left there while a mid-range move of the same size is written; a
+    # point or two at an endpoint does not change the room temperature
+    # measurably.
+    if not VALVE_RESOLUTION <= parameters[CONF_MIN_CHANGE] <= VALVE_MAX:
         errors[CONF_MIN_CHANGE] = "min_change_out_of_range"
     if parameters[CONF_MIN_TARGET] >= parameters[CONF_MAX_TARGET]:
         errors[CONF_MAX_TARGET] = "target_range_empty"

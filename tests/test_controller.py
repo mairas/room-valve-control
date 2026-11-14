@@ -192,6 +192,27 @@ def test_should_write_valve(*, output: float, readback: float, expected: bool) -
     assert should_write_valve(output, readback, MIN_CHANGE) is expected
 
 
+@pytest.mark.parametrize(
+    ("output", "readback", "expected"),
+    [
+        (50.0, 50.0, False),
+        (51.0, 50.0, True),
+        (49.0, 50.0, True),
+        (1.0, 0.0, True),
+        (0.0, 1.0, False),
+        (0.0, 2.0, False),
+        (0.0, 3.0, True),
+        (99.0, 98.0, False),
+        (98.0, 99.0, True),
+    ],
+)
+def test_should_write_valve_at_one_point(
+    *, output: float, readback: float, expected: bool
+) -> None:
+    """A one-point threshold writes any mid-range move but keeps endpoint slack."""
+    assert should_write_valve(output, readback, 1.0) is expected
+
+
 def test_closing_to_zero_written_only_at_zero() -> None:
     """Output 3 against readback 6 waits; the write comes once the output is 0."""
     controller = PIController(GAINS, integral=3.0)
