@@ -7,7 +7,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
 import pytest
-from homeassistant.components.climate.const import ATTR_CURRENT_TEMPERATURE, HVACMode
+from homeassistant.components.climate.const import ATTR_CURRENT_TEMPERATURE
 from homeassistant.config_entries import (
     RELOAD_AFTER_UPDATE_DELAY,
     ConfigEntryDisabler,
@@ -21,12 +21,11 @@ from homeassistant.const import (
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
 )
-from homeassistant.core import CoreState, State
+from homeassistant.core import CoreState
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
-    mock_restore_cache_with_extra_data,
 )
 
 from custom_components.room_valve_control import UNLOADED_TRVS
@@ -60,6 +59,7 @@ from .live_room import (
     async_wait_for,
     register_sensor,
     registry_ids,
+    restore_rooms,
     room_subentry,
 )
 
@@ -456,24 +456,6 @@ def unusable_trv_issue(hass: HomeAssistant, registry_id: str) -> object:
     """Return the repair issue raised for an unusable TRV, or None."""
     return ir.async_get(hass).async_get_issue(
         DOMAIN, f"{ISSUE_UNUSABLE_TRV}_{registry_id}"
-    )
-
-
-def restore_rooms(hass: HomeAssistant, targets: dict[str, float]) -> None:
-    """Make the room thermostats, by entity id, restore the given targets."""
-    mock_restore_cache_with_extra_data(
-        hass,
-        [
-            (
-                State(climate, HVACMode.HEAT),
-                {
-                    "target": target,
-                    "controller": None,
-                    "device_writes": 0,
-                },
-            )
-            for climate, target in targets.items()
-        ],
     )
 
 

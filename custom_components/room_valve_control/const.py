@@ -80,3 +80,6 @@ DEFAULT_FLOOR_MIN: Final = 17.0
 DEFAULT_FALLBACK_FLOOR_SETPOINT: Final = 22.0
 # Shorter on- or off-times are dropped from a period, sparing the relay.
 DEFAULT_MIN_ON_TIME: Final = timedelta(minutes=5)
+# A changed target steps the room within this long, at a random point, so that
+# rooms whose targets a calendar changes in the same second write apart.
+TARGET_STEP_MAX_DELAY: Final = timedelta(seconds=30)

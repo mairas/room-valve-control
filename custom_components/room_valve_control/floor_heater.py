@@ -39,6 +39,9 @@ SERVICE_TIMEOUT: Final = 30.0
 
 PERCENT: Final = 100
 
+# Output % from which a period too short to split is spent all on.
+MAJORITY_OUTPUT: Final = 50
+
 
 class FloorHeaterEntityError(Exception):
     """A floor heater's climate entity is missing or disabled."""
@@ -153,13 +156,17 @@ class ClimateFloorHeater:
         Start a period of output % on, then off; return the writes sent now.
 
         An on-time or off-time shorter than the minimum on-time is dropped, so
-        the period is all off or all on.
+        the period is all off or all on. When both are shorter, the period is
+        all on from 50 % output and all off below it.
         """
         await self.cancel_edge()
         on_time = period * output / PERCENT
-        if on_time < self._min_on_time:
+        off_time = period - on_time
+        if on_time < self._min_on_time and off_time < self._min_on_time:
+            on_time = period if output >= MAJORITY_OUTPUT else timedelta(0)
+        elif on_time < self._min_on_time:
             on_time = timedelta(0)
-        elif period - on_time < self._min_on_time:
+        elif off_time < self._min_on_time:
             on_time = period
         setpoint = self._on_setpoint if on_time else self._off_setpoint
         sent = await self._write(setpoint)

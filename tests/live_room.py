@@ -16,6 +16,7 @@ from homeassistant.components.climate.const import (
 )
 from homeassistant.config_entries import ConfigSubentryDataWithId
 from homeassistant.const import ATTR_ENTITY_ID, ATTR_TEMPERATURE, UnitOfTemperature
+from homeassistant.core import State
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -26,6 +27,7 @@ from pytest_homeassistant_custom_component.common import (
     async_fire_time_changed,
     mock_integration,
     mock_platform,
+    mock_restore_cache_with_extra_data,
 )
 
 from custom_components.room_valve_control.config_flow import DEFAULT_ROOM
@@ -453,16 +455,40 @@ async def async_setup_room(
     )
 
 
+def restore_rooms(hass: HomeAssistant, targets: dict[str, float]) -> None:
+    """Make the room thermostats, by entity id, restore the given targets."""
+    mock_restore_cache_with_extra_data(
+        hass,
+        [
+            (
+                State(climate, HVACMode.HEAT),
+                {
+                    "target": target,
+                    "controller": None,
+                    "device_writes": 0,
+                },
+            )
+            for climate, target in targets.items()
+        ],
+    )
+
+
 async def async_set_room_target(
     hass: HomeAssistant, target: float, climate: str = ROOM_CLIMATE
 ) -> None:
-    """Set a room thermostat's target through the climate service."""
+    """
+    Set a room thermostat's target through the climate service.
+
+    Runs the step a changed target schedules if its delay is up already, as it
+    is while the step_random fixture is at 0.
+    """
     await hass.services.async_call(
         "climate",
         "set_temperature",
         {ATTR_ENTITY_ID: climate, ATTR_TEMPERATURE: target},
         blocking=True,
     )
+    async_fire_time_changed(hass)
     await hass.async_block_till_done(wait_background_tasks=True)
 
 

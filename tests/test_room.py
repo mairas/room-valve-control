@@ -1404,6 +1404,18 @@ async def test_direct_step_applies_the_output_to_every_available_heater() -> Non
     assert room.device_writes == len(heaters) - 1
 
 
+async def test_direct_step_heats_over_the_time_to_the_next_step() -> None:
+    """A step given the time to the next one spans its period over that."""
+    heater = FakeFloorHeater()
+    room = make_floor_room([heater])
+    await room.set_target(TARGET, START)
+    period = CONTROL_STEP / 2
+
+    await room.step(START, fresh(20.0, START), period=period)
+
+    assert heater.calls == [("duty", 30, period, START)]
+
+
 async def test_stale_reading_cancels_the_off_edge_and_holds_fallback() -> None:
     """Fallback cancels the period's pending off before writing the fallback."""
     heater = FakeFloorHeater()
