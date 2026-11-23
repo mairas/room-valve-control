@@ -225,14 +225,14 @@ class RoomRuntime:
             self._unsubscribes.append(
                 async_at_started(self._hass, self._async_core_started)
             )
-        self._schedule_step(None, new_phase=True)
+        self._start_step(None, new_phase=True)
 
     @callback
     def _async_core_started(self, _hass: HomeAssistant) -> None:
         self._core_started = True
         self._readings_since = dt_util.utcnow()
         # Core starts every room at once: this step must not align them again.
-        self._schedule_step(None, new_phase=True)
+        self._start_step(None, new_phase=True)
 
     @callback
     def _async_core_stopping(self, _event: Event) -> None:
@@ -323,14 +323,14 @@ class RoomRuntime:
         return steps
 
     @callback
-    def _periodic_step(self, _now: datetime) -> None:
+    def _next_step_due(self, _now: datetime) -> None:
         self._cancel_next_step = None
-        self._schedule_step(None)
+        self._start_step(None)
 
     @callback
     def _target_step_due(self, _now: datetime) -> None:
         self._cancel_target_step = None
-        self._schedule_step(None, new_phase=True)
+        self._start_step(None, new_phase=True)
 
     def _may_schedule(self) -> bool:
         # Not once Core is stopping, which has dropped the timers.
@@ -359,7 +359,7 @@ class RoomRuntime:
         self._drop_next_step()
         if self._may_schedule():
             self._cancel_next_step = async_track_point_in_utc_time(
-                self._hass, self._periodic_step, now + interval
+                self._hass, self._next_step_due, now + interval
             )
         return interval
 
@@ -375,7 +375,7 @@ class RoomRuntime:
             # Rooms waiting since a start get their readings together, as after
             # a bridge reconnects: keep them out of lockstep.
             waiting = room.control_mode is ControlMode.WAITING
-            self._schedule_step(room.needs_immediate_step, new_phase=waiting)
+            self._start_step(room.needs_immediate_step, new_phase=waiting)
 
     @callback
     def _async_sensor_registry_updated(
@@ -387,7 +387,7 @@ class RoomRuntime:
             self._hass.config_entries.async_schedule_reload(self._entry.entry_id)
 
     @callback
-    def _schedule_step(
+    def _start_step(
         self, condition: StepCondition | None, *, new_phase: bool = False
     ) -> None:
         """
