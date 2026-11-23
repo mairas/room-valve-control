@@ -237,6 +237,36 @@ async def test_short_off_time_stays_on(
     assert edge_writes == []
 
 
+@pytest.mark.parametrize(
+    ("period", "output", "expected"),
+    [
+        (MIN_ON_TIME - timedelta(minutes=1), 100, ON),
+        (MIN_ON_TIME - timedelta(minutes=1), 50, ON),
+        (MIN_ON_TIME - timedelta(minutes=1), 49, OFF),
+        (MIN_ON_TIME - timedelta(minutes=1), 0, OFF),
+        (MIN_ON_TIME, 99, ON),
+        (MIN_ON_TIME * 1.5, 60, ON),
+        (MIN_ON_TIME * 1.5, 40, OFF),
+    ],
+)
+async def test_short_period_follows_majority(  # noqa: PLR0913, PLR0917
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    heater: ClimateFloorHeater,
+    writes: list[Write],
+    edge_writes: list[int],
+    period: timedelta,
+    output: float,
+    expected: Write,
+) -> None:
+    """With on- and off-time both under the minimum, the majority side wins."""
+    await heater.apply_duty(output, period, dt_util.utcnow())
+    await async_advance(hass, freezer, period)
+
+    assert writes == [expected]
+    assert edge_writes == []
+
+
 async def test_new_period_replaces_pending_off(
     hass: HomeAssistant,
     freezer: FrozenDateTimeFactory,
