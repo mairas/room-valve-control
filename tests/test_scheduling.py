@@ -162,6 +162,26 @@ async def test_reading_that_ends_waiting_keeps_a_random_phase(
     )
 
 
+async def test_sensor_back_from_stale_keeps_the_full_step(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    calls: list[TrvCall],
+    step_random: FixedRandom,
+) -> None:
+    """A wall sensor back from stale steps the room, then a full step later."""
+    await _async_direct_room(hass, calls, step_random)
+    await async_advance(hass, freezer, DEFAULT_STALE_TIMEOUT + DEFAULT_CONTROL_STEP)
+    assert calls != []
+    calls.clear()
+
+    await _async_set_reading(hass, READING)
+    assert len(valve_writes(calls)) == len(TRVS)
+
+    await _async_assert_steps_at(
+        hass, freezer, calls, [DEFAULT_CONTROL_STEP, DEFAULT_CONTROL_STEP]
+    )
+
+
 async def test_unloading_cancels_the_next_step(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory, calls: list[TrvCall]
 ) -> None:
