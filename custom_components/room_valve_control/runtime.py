@@ -415,8 +415,8 @@ class RoomRuntime:
             readings = self.readings()
             if condition is not None and not condition(now, readings):
                 return
-            self._arm_next_step(now, new_phase=new_phase)
-            await room.step(now, readings)
+            period = self._arm_next_step(now, new_phase=new_phase)
+            await room.step(now, readings, period=period)
         self._notify()
 
     @callback

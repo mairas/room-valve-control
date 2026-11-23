@@ -62,7 +62,7 @@ class Room:
     """
     The control state machine of one room and its TRVs or floor heaters.
 
-    A floor room gets the PI output as the share of each control step its
+    A floor room gets the PI output as the share of each step's period its
     heaters heat. Without the room they hold the fallback floor setpoint, so
     every way out of direct control writes it, after the heater has dropped
     its pending off edge.
@@ -232,19 +232,34 @@ class Room:
             if self._mode is not ControlMode.STOPPED:
                 await self._hold_fallback()
 
-    async def step(self, now: datetime, readings: Sequence[Reading]) -> None:
-        """Run one control step; a stopped room does nothing."""
+    async def step(
+        self,
+        now: datetime,
+        readings: Sequence[Reading],
+        *,
+        period: timedelta | None = None,
+    ) -> None:
+        """
+        Run one control step; a stopped room does nothing.
+
+        period is the time to the next step, which a floor room's heating
+        period spans; the control step if not given.
+        """
         async with self._lock:
             if self._mode is not ControlMode.STOPPED:
-                await self._step(now, readings)
+                if period is None:
+                    period = self._settings.control_step
+                await self._step(now, readings, period)
 
-    async def _step(self, now: datetime, readings: Sequence[Reading]) -> None:
+    async def _step(
+        self, now: datetime, readings: Sequence[Reading], period: timedelta
+    ) -> None:
         if self._target is None:
             return
         self._adopt_press()
         reading = self.current_reading(now, readings)
         if reading is not None:
-            await self._step_direct(now, self._target, reading)
+            await self._step_direct(now, self._target, reading, period)
             return
         in_startup_grace = now - self._started_at < self._settings.stale_timeout
         if self._mode is ControlMode.WAITING and in_startup_grace:
@@ -283,7 +298,9 @@ class Room:
             )
             self._target = pressed.setpoint
 
-    async def _step_direct(self, now: datetime, target: float, reading: float) -> None:
+    async def _step_direct(
+        self, now: datetime, target: float, reading: float, period: timedelta
+    ) -> None:
         self._mode = ControlMode.DIRECT
         # A new room's first direct step has no interval behind it to integrate.
         elapsed = timedelta(0)
@@ -300,9 +317,7 @@ class Room:
         self._last_output = output
         self._last_error = target - reading
         for heater in heaters:
-            self._device_writes += await heater.apply_duty(
-                output, self._settings.control_step, now
-            )
+            self._device_writes += await heater.apply_duty(output, period, now)
         for trv in available:
             # Entering direct mode moves the valve to its last direct-mode value,
             # which the readback does not show yet.

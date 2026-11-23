@@ -27,7 +27,9 @@ from custom_components.room_valve_control.const import (
     DOMAIN,
     ISSUE_ROOM_WITHOUT_DEVICES,
     ISSUE_UNUSABLE_FLOOR_HEATER,
+    TARGET_STEP_MAX_DELAY,
 )
+from custom_components.room_valve_control.floor_heater import PERCENT
 
 from .live_room import (
     FLOOR_HEATERS,
@@ -49,6 +51,8 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
     from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+    from .conftest import FixedRandom
+
 ROOM_ID: Final = "bathroom_subentry"
 ROOM_TITLE: Final = "Bathroom"
 ROOM_CLIMATE: Final = "climate.bathroom"
@@ -63,6 +67,14 @@ READING: Final = "20.0"
 ON_TIME: Final = timedelta(minutes=9)
 JUST_BEFORE: Final = timedelta(seconds=1)
 RELOAD_AFTER: Final = timedelta(minutes=5)
+# A target-change step 6 s after the change, the next step 24 min after it.
+STEP_SHARE: Final = 0.2
+TARGET_DELAY: Final = TARGET_STEP_MAX_DELAY * STEP_SHARE
+SHORT_PERIOD: Final = CONTROL_STEP * (1 - STEP_SHARE)
+# 1.5 °C below it: 45 %, the step before having integrated nothing.
+NEW_TARGET: Final = 21.5
+NEW_OUTPUT_PERCENT: Final = 45
+MID_PERIOD: Final = timedelta(minutes=2)
 
 
 class FakeFloorFlow(ConfigFlow):
@@ -296,3 +308,56 @@ async def test_room_without_usable_heater_is_not_set_up(
         DOMAIN, f"{ISSUE_ROOM_WITHOUT_DEVICES}_{ROOM_ID}"
     )
     assert floor_calls == []
+
+
+async def test_duty_period_is_the_time_to_the_next_step(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    floor_calls: list[TrvCall],
+    step_random: FixedRandom,
+) -> None:
+    """A step whose next step is closer than a control step heats a share of that."""
+    step_random.value = STEP_SHARE
+    hass.states.async_set(WALL_SENSOR, READING)
+    await async_setup_floor_room(hass)
+    floor_calls.clear()
+    await async_set_room_target(hass, TARGET, ROOM_CLIMATE)
+    await async_advance(hass, freezer, TARGET_DELAY)
+    assert floor_calls == [setpoint(DEFAULT_FLOOR_MAX)]
+
+    on_time = SHORT_PERIOD * (ON_TIME / CONTROL_STEP)
+    await async_advance(hass, freezer, on_time - JUST_BEFORE)
+    assert floor_calls == [setpoint(DEFAULT_FLOOR_MAX)]
+    await async_advance(hass, freezer, JUST_BEFORE)
+
+    assert floor_calls == [setpoint(DEFAULT_FLOOR_MAX), setpoint(DEFAULT_FLOOR_MIN)]
+
+
+async def test_target_step_mid_period_starts_a_period_to_the_next_step(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    floor_calls: list[TrvCall],
+    step_random: FixedRandom,
+) -> None:
+    """A changed target drops the pending off edge for one of its own period."""
+    hass.states.async_set(WALL_SENSOR, READING)
+    await async_setup_floor_room(hass)
+    await async_set_room_target(hass, TARGET, ROOM_CLIMATE)
+    await async_advance(hass, freezer, MID_PERIOD)
+    floor_calls.clear()
+    step_random.value = STEP_SHARE
+
+    await async_set_room_target(hass, NEW_TARGET, ROOM_CLIMATE)
+    await async_advance(hass, freezer, TARGET_DELAY)
+    assert floor_calls == [setpoint(DEFAULT_FLOOR_MAX)]
+    await async_advance(hass, freezer, ON_TIME - MID_PERIOD - TARGET_DELAY)
+    assert floor_calls == [setpoint(DEFAULT_FLOOR_MAX)]
+
+    on_time = SHORT_PERIOD * NEW_OUTPUT_PERCENT / PERCENT
+    await async_advance(
+        hass, freezer, on_time - (ON_TIME - MID_PERIOD - TARGET_DELAY) - JUST_BEFORE
+    )
+    assert floor_calls == [setpoint(DEFAULT_FLOOR_MAX)]
+    await async_advance(hass, freezer, JUST_BEFORE)
+
+    assert floor_calls == [setpoint(DEFAULT_FLOOR_MAX), setpoint(DEFAULT_FLOOR_MIN)]
