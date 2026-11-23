@@ -2,17 +2,19 @@
 
 import asyncio
 import logging
+import random
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import CALLBACK_TYPE, CoreState, HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.event import (
     async_track_entity_registry_updated_event,
+    async_track_point_in_utc_time,
     async_track_state_change_event,
     async_track_state_report_event,
-    async_track_time_interval,
 )
 from homeassistant.helpers.start import async_at_started
 from homeassistant.util import dt as dt_util
@@ -47,6 +49,9 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
+# Spreads the rooms' steps in time, not a secret; tests replace it.
+step_random = random.Random()  # noqa: S311
+
 type StepCondition = Callable[[datetime, Sequence[Reading]], bool]
 type RoomValveControlConfigEntry = ConfigEntry[dict[str, RoomRuntime]]
 
@@ -55,7 +60,11 @@ class RoomRuntime:
     """
     One room's devices and control state, stepped on a timer and on readings.
 
-    The devices are TRVs or floor heaters, never both.
+    The devices are TRVs or floor heaters, never both. Every step schedules
+    the next. A step that starts the room takes the next one a random share of
+    the control step away, so that rooms started together do not step, and
+    write their devices, together; any other step takes it a full control step
+    away.
     """
 
     def __init__(
@@ -100,6 +109,7 @@ class RoomRuntime:
         # itself serializes its writes.
         self._step_lock = asyncio.Lock()
         self._stepped_with_target = False
+        self._cancel_next_step: CALLBACK_TYPE | None = None
         # Every step in flight or waiting for the step lock, so that stopping
         # can cancel them instead of waiting behind a stalled TRV write.
         self._step_tasks: set[asyncio.Task[None]] = set()
@@ -195,13 +205,6 @@ class RoomRuntime:
         for trv in self._trvs.values():
             trv.start_listening()
         self._unsubscribes = [
-            async_track_time_interval(
-                self._hass,
-                self._periodic_step,
-                self._settings.control_step,
-                name=f"{DOMAIN} {self.name} step",
-                cancel_on_shutdown=True,
-            ),
             async_track_state_change_event(
                 self._hass, self._sensor_ids, self._async_reading_event
             ),
@@ -211,6 +214,9 @@ class RoomRuntime:
             async_track_entity_registry_updated_event(
                 self._hass, self._sensor_ids, self._async_sensor_registry_updated
             ),
+            self._hass.bus.async_listen(
+                EVENT_HOMEASSISTANT_STOP, self._async_core_stopping
+            ),
         ]
         if self._hass.state is CoreState.running:
             self._core_started = True
@@ -218,13 +224,18 @@ class RoomRuntime:
             self._unsubscribes.append(
                 async_at_started(self._hass, self._async_core_started)
             )
-        self._schedule_step(None)
+        self._schedule_step(None, new_phase=True)
 
     @callback
     def _async_core_started(self, _hass: HomeAssistant) -> None:
         self._core_started = True
         self._readings_since = dt_util.utcnow()
-        self._schedule_step(None)
+        # Core starts every room at once: this step must not align them again.
+        self._schedule_step(None, new_phase=True)
+
+    @callback
+    def _async_core_stopping(self, _event: Event) -> None:
+        self._drop_next_step()
 
     def _restore_controller(self, state: Mapping[str, object] | None) -> PIController:
         gains = self._gains
@@ -287,6 +298,7 @@ class RoomRuntime:
     def _stop_stepping(self) -> set[asyncio.Task[None]]:
         """Drop the timer and listeners and cancel the steps; return those."""
         self._stopped = True
+        self._drop_next_step()
         for unsubscribe in self._unsubscribes:
             unsubscribe()
         self._unsubscribes = []
@@ -301,7 +313,29 @@ class RoomRuntime:
 
     @callback
     def _periodic_step(self, _now: datetime) -> None:
+        self._cancel_next_step = None
         self._schedule_step(None)
+
+    @callback
+    def _drop_next_step(self) -> None:
+        if self._cancel_next_step is not None:
+            self._cancel_next_step()
+            self._cancel_next_step = None
+
+    @callback
+    def _arm_next_step(self, now: datetime, *, new_phase: bool) -> timedelta:
+        """Replace the scheduled next step; return the time to it."""
+        interval = self._settings.control_step
+        if new_phase:
+            # 1 - random() is in (0, 1]: never a second step at the same instant.
+            interval *= 1 - step_random.random()
+        self._drop_next_step()
+        # Not once Core is stopping, which has dropped the timer.
+        if not (self._stopped or self._hass.is_stopping):
+            self._cancel_next_step = async_track_point_in_utc_time(
+                self._hass, self._periodic_step, now + interval
+            )
+        return interval
 
     @callback
     def _async_reading_event(
@@ -323,18 +357,28 @@ class RoomRuntime:
             self._hass.config_entries.async_schedule_reload(self._entry.entry_id)
 
     @callback
-    def _schedule_step(self, condition: StepCondition | None) -> None:
-        """Run a step as a task of the entry, which unloading cancels."""
+    def _schedule_step(
+        self, condition: StepCondition | None, *, new_phase: bool = False
+    ) -> None:
+        """
+        Run a step as a task of the entry, which unloading cancels.
+
+        new_phase puts the next step a random share of the control step away.
+        """
         if self._stopped:
             return
         task = self._entry.async_create_background_task(
-            self._hass, self._async_step(condition), f"{DOMAIN} {self.name} step"
+            self._hass,
+            self._async_step(condition, new_phase=new_phase),
+            f"{DOMAIN} {self.name} step",
         )
         if not task.done():
             self._step_tasks.add(task)
             task.add_done_callback(self._step_tasks.discard)
 
-    async def _async_step(self, condition: StepCondition | None) -> None:
+    async def _async_step(
+        self, condition: StepCondition | None, *, new_phase: bool
+    ) -> None:
         """Run a step, if condition still holds once the lock is held."""
         async with self._step_lock:
             room = self.room
@@ -344,6 +388,7 @@ class RoomRuntime:
             readings = self.readings()
             if condition is not None and not condition(now, readings):
                 return
+            self._arm_next_step(now, new_phase=new_phase)
             await room.step(now, readings)
             if room.target is not None:
                 self._stepped_with_target = True

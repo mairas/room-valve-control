@@ -16,6 +16,7 @@ from homeassistant.components.climate.const import (
 )
 from homeassistant.config_entries import ConfigSubentryDataWithId
 from homeassistant.const import ATTR_ENTITY_ID, ATTR_TEMPERATURE, UnitOfTemperature
+from homeassistant.core import State
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -26,6 +27,7 @@ from pytest_homeassistant_custom_component.common import (
     async_fire_time_changed,
     mock_integration,
     mock_platform,
+    mock_restore_cache_with_extra_data,
 )
 
 from custom_components.room_valve_control.config_flow import DEFAULT_ROOM
@@ -450,6 +452,24 @@ async def async_setup_room(
         trvs = registry_ids(hass, [ids.climate for ids in TRVS])
     return await async_setup_rooms(
         hass, [room_subentry(ROOM_ID, ROOM_TITLE, sensors=sensors, trvs=trvs)]
+    )
+
+
+def restore_rooms(hass: HomeAssistant, targets: dict[str, float]) -> None:
+    """Make the room thermostats, by entity id, restore the given targets."""
+    mock_restore_cache_with_extra_data(
+        hass,
+        [
+            (
+                State(climate, HVACMode.HEAT),
+                {
+                    "target": target,
+                    "controller": None,
+                    "device_writes": 0,
+                },
+            )
+            for climate, target in targets.items()
+        ],
     )
 
 

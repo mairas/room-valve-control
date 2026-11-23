@@ -2,6 +2,8 @@
 
 A Home Assistant custom component that controls radiator valves, or electric floor heating (see [Floor heating](#floor-heating)), room by room. Each room gets one `climate` entity; a PI controller reads the room's wall temperature sensor and sets the valve position on the room's thermostatic radiator valves (TRVs) directly. When the wall sensor stops reporting, the TRVs are handed back to their own regulation with a temperature offset kept current while the sensor was live. A setpoint set by hand on one of a room's TRVs becomes the room's target at the next control step, and the room's other TRVs follow it. Disabling a room's thermostat also hands its TRVs back. Nothing else does: a Home Assistant stop or restart, a reload after a room is added or changed, a room removed, a TRV taken out of its room, and the integration disabled or deleted all leave the TRVs as they are, in valve-position mode at their last position if they were under control. A TRV that is not usable at setup, because its registry entry is gone or one of its entities is disabled, is left out of its room, and left as it is, with a repair issue; the rest of the room and the other rooms are set up, and a room left with no usable TRV is not.
 
+A room steps once per control step (default 15 min). The first step after the room starts, or after Home Assistant has started, comes a random share of the control step later, so rooms started together do not all write their devices in the same few seconds; the steps after it follow every control step. A wall sensor that comes back after it was stale, or reports for the first time, steps the room at once.
+
 Supported devices:
 
 - TRVs: Eurotronic Spirit Z-Wave Plus, through the Z-Wave JS integration.
