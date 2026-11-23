@@ -3,7 +3,11 @@
 from datetime import timedelta
 from typing import TYPE_CHECKING, Final
 
-from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, STATE_UNKNOWN
+from homeassistant.const import (
+    EVENT_HOMEASSISTANT_STARTED,
+    EVENT_HOMEASSISTANT_STOP,
+    STATE_UNKNOWN,
+)
 from homeassistant.core import CoreState
 
 from custom_components.room_valve_control.const import (
@@ -297,6 +301,26 @@ async def test_unloading_cancels_a_pending_target_step(
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done(wait_background_tasks=True)
     await async_advance(hass, freezer, TARGET_STEP_MAX_DELAY)
+
+    assert calls == []
+
+
+async def test_core_stop_drops_the_pending_steps(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    calls: list[TrvCall],
+    step_random: FixedRandom,
+) -> None:
+    """Once Core is stopping, neither a target step nor the next step runs."""
+    await _async_direct_room(hass, calls, step_random)
+    await _async_set_reading(hass, READINGS[0])
+    await async_set_room_target(hass, NEW_TARGET)
+
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STOP)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    await async_advance(hass, freezer, TARGET_STEP_MAX_DELAY)
+    assert calls == []
+    await async_advance(hass, freezer, DEFAULT_CONTROL_STEP)
 
     assert calls == []
 
