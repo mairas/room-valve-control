@@ -47,6 +47,8 @@ if TYPE_CHECKING:
     from freezegun.api import FrozenDateTimeFactory
     from homeassistant.core import HomeAssistant
 
+    from .conftest import FixedRandom
+
 INTEGRATOR_SENSOR: Final = "sensor.living_room_integrator"
 WRITES_SENSOR: Final = "sensor.living_room_device_writes"
 RESTORED_TARGET: Final = 20.8
@@ -65,6 +67,8 @@ FALLBACK_TARGET: Final = 20.5
 OFF_STEP_TARGET: Final = 21.3
 ON_STEP_TARGET: Final = 21.5
 STEPS_IN_STARTUP_GRACE: Final = DEFAULT_STALE_TIMEOUT // DEFAULT_CONTROL_STEP - 1
+# Any share above 0 delays a target-change step past the service call.
+STEP_DELAY_SHARE: Final = 0.5
 
 
 def restore(hass: HomeAssistant, extra: dict[str, Any]) -> None:
@@ -98,10 +102,10 @@ async def test_thermostat_is_heat_only_on_the_room_device(
     assert calls == []
 
 
-async def test_target_is_echoed_and_first_target_steps_at_once(
-    hass: HomeAssistant, calls: list[TrvCall]
+async def test_target_is_echoed_at_once(
+    hass: HomeAssistant, calls: list[TrvCall], step_random: FixedRandom
 ) -> None:
-    """The first target acts at once; later ones wait for the step in direct."""
+    """A target shows at once, before the step that follows it writes."""
     hass.states.async_set(WALL_SENSOR, BELOW_TARGET)
     await async_setup_room(hass)
 
@@ -112,6 +116,7 @@ async def test_target_is_echoed_and_first_target_steps_at_once(
     assert state.attributes[ATTR_TEMPERATURE] == RESTORED_TARGET
     assert {call[1] for call in calls} >= {ids.valve for ids in TRVS}
     calls.clear()
+    step_random.value = STEP_DELAY_SHARE
 
     await async_set_room_target(hass, NEXT_TARGET)
 

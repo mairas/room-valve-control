@@ -476,13 +476,19 @@ def restore_rooms(hass: HomeAssistant, targets: dict[str, float]) -> None:
 async def async_set_room_target(
     hass: HomeAssistant, target: float, climate: str = ROOM_CLIMATE
 ) -> None:
-    """Set a room thermostat's target through the climate service."""
+    """
+    Set a room thermostat's target through the climate service.
+
+    Runs the step a changed target schedules if its delay is up already, as it
+    is while the step_random fixture is at 0.
+    """
     await hass.services.async_call(
         "climate",
         "set_temperature",
         {ATTR_ENTITY_ID: climate, ATTR_TEMPERATURE: target},
         blocking=True,
     )
+    async_fire_time_changed(hass)
     await hass.async_block_till_done(wait_background_tasks=True)
 
 

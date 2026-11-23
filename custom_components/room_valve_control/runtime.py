@@ -31,6 +31,7 @@ from .const import (
     CONF_TI,
     DEFAULT_FALLBACK_FLOOR_SETPOINT,
     DOMAIN,
+    TARGET_STEP_MAX_DELAY,
 )
 from .controller import PIController, PIGains
 from .registry import entity_ids
@@ -61,10 +62,10 @@ class RoomRuntime:
     One room's devices and control state, stepped on a timer and on readings.
 
     The devices are TRVs or floor heaters, never both. Every step schedules
-    the next. A step that starts the room takes the next one a random share of
-    the control step away, so that rooms started together do not step, and
-    write their devices, together; any other step takes it a full control step
-    away.
+    the next. A step that starts the room or follows a changed target takes the
+    next one a random share of the control step away, so that rooms started or
+    changed together do not step, and write their devices, together; any other
+    step takes it a full control step away.
     """
 
     def __init__(
@@ -108,8 +109,8 @@ class RoomRuntime:
         # Keeps an immediate step's condition and the step together; Room
         # itself serializes its writes.
         self._step_lock = asyncio.Lock()
-        self._stepped_with_target = False
         self._cancel_next_step: CALLBACK_TYPE | None = None
+        self._cancel_target_step: CALLBACK_TYPE | None = None
         # Every step in flight or waiting for the step lock, so that stopping
         # can cancel them instead of waiting behind a stalled TRV write.
         self._step_tasks: set[asyncio.Task[None]] = set()
@@ -235,7 +236,7 @@ class RoomRuntime:
 
     @callback
     def _async_core_stopping(self, _event: Event) -> None:
-        self._drop_next_step()
+        self._drop_timers()
 
     def _restore_controller(self, state: Mapping[str, object] | None) -> PIController:
         gains = self._gains
@@ -248,12 +249,22 @@ class RoomRuntime:
             return PIController(gains)
 
     async def async_set_target(self, target: float) -> None:
-        """Set the room's target; step at once if the room has not run with one."""
-        if self.room is None:
+        """
+        Set the room's target; a changed one steps the room after a random delay.
+
+        Further changes before that step only set the target it steps to.
+        """
+        room = self.room
+        if room is None:
             return
-        await self.room.set_target(target, dt_util.utcnow())
+        changed = target != room.target
+        await room.set_target(target, dt_util.utcnow())
         self._notify()
-        self._schedule_step(lambda _now, _readings: not self._stepped_with_target)
+        if changed and self._cancel_target_step is None and self._may_schedule():
+            delay = TARGET_STEP_MAX_DELAY * step_random.random()
+            self._cancel_target_step = async_track_point_in_utc_time(
+                self._hass, self._target_step_due, dt_util.utcnow() + delay
+            )
 
     @property
     def trvs(self) -> Mapping[str, SpiritTrv]:
@@ -298,7 +309,7 @@ class RoomRuntime:
     def _stop_stepping(self) -> set[asyncio.Task[None]]:
         """Drop the timer and listeners and cancel the steps; return those."""
         self._stopped = True
-        self._drop_next_step()
+        self._drop_timers()
         for unsubscribe in self._unsubscribes:
             unsubscribe()
         self._unsubscribes = []
@@ -317,6 +328,22 @@ class RoomRuntime:
         self._schedule_step(None)
 
     @callback
+    def _target_step_due(self, _now: datetime) -> None:
+        self._cancel_target_step = None
+        self._schedule_step(None, new_phase=True)
+
+    def _may_schedule(self) -> bool:
+        # Not once Core is stopping, which has dropped the timers.
+        return not (self._stopped or self._hass.is_stopping)
+
+    @callback
+    def _drop_timers(self) -> None:
+        self._drop_next_step()
+        if self._cancel_target_step is not None:
+            self._cancel_target_step()
+            self._cancel_target_step = None
+
+    @callback
     def _drop_next_step(self) -> None:
         if self._cancel_next_step is not None:
             self._cancel_next_step()
@@ -330,8 +357,7 @@ class RoomRuntime:
             # 1 - random() is in (0, 1]: never a second step at the same instant.
             interval *= 1 - step_random.random()
         self._drop_next_step()
-        # Not once Core is stopping, which has dropped the timer.
-        if not (self._stopped or self._hass.is_stopping):
+        if self._may_schedule():
             self._cancel_next_step = async_track_point_in_utc_time(
                 self._hass, self._periodic_step, now + interval
             )
@@ -363,7 +389,8 @@ class RoomRuntime:
         """
         Run a step as a task of the entry, which unloading cancels.
 
-        new_phase puts the next step a random share of the control step away.
+        new_phase puts the next step a random share of the control step away,
+        not a full one.
         """
         if self._stopped:
             return
@@ -390,8 +417,6 @@ class RoomRuntime:
                 return
             self._arm_next_step(now, new_phase=new_phase)
             await room.step(now, readings)
-            if room.target is not None:
-                self._stepped_with_target = True
         self._notify()
 
     @callback
