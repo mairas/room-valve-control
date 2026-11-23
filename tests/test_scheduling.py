@@ -128,6 +128,36 @@ async def test_core_started_step_restarts_at_a_random_point(
     )
 
 
+async def test_reading_that_ends_waiting_keeps_a_random_phase(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    calls: list[TrvCall],
+    step_random: FixedRandom,
+) -> None:
+    """
+    The first reading after Core has started steps the room at a random phase.
+
+    Sensors that report together, as after a bridge reconnects, must not put
+    the rooms waiting for them in lockstep.
+    """
+    hass.set_state(CoreState.starting)
+    restore_rooms(hass, {ROOM_CLIMATE: TARGET})
+    await async_setup_room(hass)
+    step_random.value = HALF
+    hass.set_state(CoreState.running)
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert calls == []
+
+    await async_advance(hass, freezer, SOONER)
+    await _async_set_reading(hass, READING)
+    assert len(valve_writes(calls)) == len(TRVS)
+
+    await _async_assert_steps_at(
+        hass, freezer, calls, [FIRST_INTERVAL, DEFAULT_CONTROL_STEP]
+    )
+
+
 async def test_unloading_cancels_the_next_step(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory, calls: list[TrvCall]
 ) -> None:

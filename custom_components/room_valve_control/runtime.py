@@ -35,7 +35,7 @@ from .const import (
 )
 from .controller import PIController, PIGains
 from .registry import entity_ids
-from .room import Reading, Room, RoomSettings
+from .room import ControlMode, Reading, Room, RoomSettings
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -368,10 +368,14 @@ class RoomRuntime:
         self, _event: Event[EventStateChangedData] | Event[EventStateReportedData]
     ) -> None:
         self._notify()
-        if self.room is not None and self.room.needs_immediate_step(
+        room = self.room
+        if room is not None and room.needs_immediate_step(
             dt_util.utcnow(), self.readings()
         ):
-            self._schedule_step(self.room.needs_immediate_step)
+            # Rooms waiting since a start get their readings together, as after
+            # a bridge reconnects: keep them out of lockstep.
+            waiting = room.control_mode is ControlMode.WAITING
+            self._schedule_step(room.needs_immediate_step, new_phase=waiting)
 
     @callback
     def _async_sensor_registry_updated(
